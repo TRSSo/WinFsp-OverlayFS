@@ -712,13 +712,10 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
                     CREATE_NEW,
                     FileAttributes ? FileAttributes : FILE_ATTRIBUTE_NORMAL, 0);
     if (h != INVALID_HANDLE_VALUE && AllocationSize) {
-      LARGE_INTEGER li;
-      li.QuadPart = (LONGLONG)AllocationSize;
-      SetFilePointerEx(h, li, 0, FILE_BEGIN);
-      SetEndOfFile(h);
-      li.QuadPart = 0;
-      SetFilePointerEx(h, li, 0, FILE_BEGIN);
-      SetEndOfFile(h); /* 文件大小=0, 保留分配大小 */
+      FILE_ALLOCATION_INFO AllocInfo;
+      AllocInfo.AllocationSize.QuadPart = (LONGLONG)AllocationSize;
+      SetFileInformationByHandle(h, FileAllocationInfo, &AllocInfo,
+                                 sizeof(AllocInfo));
     }
   }
   if (h == INVALID_HANDLE_VALUE) {

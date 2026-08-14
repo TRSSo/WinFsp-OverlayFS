@@ -1026,17 +1026,25 @@ static NTSTATUS OvlSetFileSize(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                UINT64 NewSize, BOOLEAN SetAllocationSize,
                                FSP_FSCTL_FILE_INFO *FileInfo) {
   (void)Fs;
-  (void)SetAllocationSize;
   OVL_DESC *Desc = FileContext;
   NTSTATUS R = EnsureUpperWritable(Desc);
   if (!NT_SUCCESS(R))
     return R;
-  LARGE_INTEGER li;
-  li.QuadPart = (LONGLONG)NewSize;
-  if (!SetFilePointerEx(Desc->Handle, li, 0, FILE_BEGIN))
-    return W32Err(GetLastError());
-  if (!SetEndOfFile(Desc->Handle))
-    return W32Err(GetLastError());
+
+  if (SetAllocationSize) {
+    FILE_ALLOCATION_INFO AllocInfo;
+    AllocInfo.AllocationSize.QuadPart = (LONGLONG)NewSize;
+    if (!SetFileInformationByHandle(Desc->Handle, FileAllocationInfo,
+                                    &AllocInfo, sizeof(AllocInfo)))
+      return W32Err(GetLastError());
+  } else {
+    FILE_END_OF_FILE_INFO EofInfo;
+    EofInfo.EndOfFile.QuadPart = (LONGLONG)NewSize;
+    if (!SetFileInformationByHandle(Desc->Handle, FileEndOfFileInfo, &EofInfo,
+                                    sizeof(EofInfo)))
+      return W32Err(GetLastError());
+  }
+
   GetFileInfoFromHandle(Desc->Handle, FileInfo);
   return STATUS_SUCCESS;
 }

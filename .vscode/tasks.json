@@ -1,0 +1,28 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cppbuild",
+			"label": "MSVC: build active file",
+			"command": "cl.exe",
+			"args": [
+				"/O2",
+				"/W3",
+				"/I${env:ProgramFiles(x86)}\\WinFsp\\inc",
+				"${workspaceFolder}\\ovlfs.c",
+				"/link",
+				"/LIBPATH:${env:ProgramFiles(x86)}\\WinFsp\\lib",
+				"winfsp-x64.lib"
+			],
+			"options": {
+				"cwd": "${fileDirname}"
+			},
+			"problemMatcher": ["$msCompile"],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"detail": "compiler: cl.exe"
+		}
+	]
+}

@@ -853,21 +853,18 @@ static NTSTATUS OvlOverwrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     Desc->UpperExists = TRUE;
     RemoveWhiteout(Desc->RelName);
   } else {
-    /* [FIX] upper 文件已存在: 覆盖语义必须先把内容清空 */
-    LARGE_INTEGER li;
-    li.QuadPart = 0;
-    SetFilePointerEx(Desc->Handle, li, 0, FILE_BEGIN);
-    if (!SetEndOfFile(Desc->Handle))
+    FILE_END_OF_FILE_INFO EofInfo;
+    EofInfo.EndOfFile.QuadPart = 0;
+    if (!SetFileInformationByHandle(Desc->Handle, FileEndOfFileInfo, &EofInfo,
+                                    sizeof(EofInfo)))
       return W32Err(GetLastError());
   }
 
   if (AllocationSize) {
-    LARGE_INTEGER li;
-    li.QuadPart = (LONGLONG)AllocationSize;
-    SetFilePointerEx(Desc->Handle, li, 0, FILE_BEGIN);
-    SetEndOfFile(Desc->Handle);
-    li.QuadPart = 0;
-    SetFilePointerEx(Desc->Handle, li, 0, FILE_BEGIN);
+    FILE_ALLOCATION_INFO AllocInfo;
+    AllocInfo.AllocationSize.QuadPart = (LONGLONG)AllocationSize;
+    SetFileInformationByHandle(Desc->Handle, FileAllocationInfo, &AllocInfo,
+                               sizeof(AllocInfo));
   }
 
   if (FileAttributes) {

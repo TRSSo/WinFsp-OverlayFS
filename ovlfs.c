@@ -263,12 +263,12 @@ static PWSTR WhiteoutPathOf(PCWSTR Rel) {
 }
 
 static BOOLEAN WhiteoutExistsAt(PCWSTR Rel) {
-  BOOLEAN b = FALSE;
   PWSTR wp = WhiteoutPathOf(Rel);
-  if (wp) {
-    b = GetFileAttributesW(wp) != INVALID_FILE_ATTRIBUTES;
-    free(wp);
+  if (!wp) {
+    return FALSE;
   }
+  BOOLEAN b = GetFileAttributesW(wp) != INVALID_FILE_ATTRIBUTES;
+  free(wp);
   return b;
 }
 
@@ -533,16 +533,8 @@ static VOID MakeWhiteout(PCWSTR Rel) {
   free(wp);
 }
 
-static VOID RemoveWhiteout(PCWSTR Rel) {
-  PWSTR wp = WhiteoutPathOf(Rel);
-  if (!wp)
-    return;
-  DeleteFileW(wp);
-  free(wp);
-}
-
-/* 递归删除 upper 目录树中的所有 whiteout (物理删除 upper 目录前需要) */
-static VOID PurgeWhiteoutsRecursive(PWSTR DirPath) {
+/* 递归删除 upper 目录树中的所有文件或 whiteout */
+static VOID PurgeWhiteoutsRecursive(PWSTR DirPath, BOOLEAN All) {
   PWSTR Pat = StrCat2(DirPath, L"\\*");
   if (!Pat)
     return;
@@ -559,14 +551,32 @@ static VOID PurgeWhiteoutsRecursive(PWSTR DirPath) {
     if (!Full)
       continue;
     if (Fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-      PurgeWhiteoutsRecursive(Full);
-    else if (wcsncmp(Fd.cFileName, WHITEOUT_PREFIX, WHITEOUT_PREFIX_LEN) == 0) {
+      PurgeWhiteoutsRecursive(Full, All);
+    else if (All ||
+             wcsncmp(Fd.cFileName, WHITEOUT_PREFIX, WHITEOUT_PREFIX_LEN) == 0) {
       SetFileAttributesW(Full, FILE_ATTRIBUTE_NORMAL);
       DeleteFileW(Full);
     }
     free(Full);
   } while (FindNextFileW(F, &Fd));
   FindClose(F);
+  if (All)
+    RemoveDirectoryW(DirPath);
+}
+
+static VOID RemoveWhiteout(PCWSTR Rel) {
+  PWSTR wp = WhiteoutPathOf(Rel);
+  if (!wp)
+    return;
+
+  DWORD attr = GetFileAttributesW(wp);
+  if (attr == INVALID_FILE_ATTRIBUTES) {
+  } else if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+    PurgeWhiteoutsRecursive(wp, TRUE);
+  } else {
+    DeleteFileW(wp);
+  }
+  free(wp);
 }
 
 /* ------------------------------------------------------------------ */
@@ -895,8 +905,7 @@ static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PWSTR FileName,
     if (Desc->LowerExists)
       MakeWhiteout(Desc->RelName);
     if (Desc->IsDirectory) {
-      PurgeWhiteoutsRecursive(Desc->UpperPath);
-      RemoveDirectoryW(Desc->UpperPath);
+      PurgeWhiteoutsRecursive(Desc->UpperPath, TRUE);
     } else
       DeleteFileW(Desc->UpperPath);
     if (!Desc->LowerExists)
@@ -1094,6 +1103,21 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   (void)Fs;
   (void)FileName;
   OVL_DESC *Desc = FileContext;
+
+  UINT32 TAttr;
+  BOOLEAN TargetExists = MergedLookup(NewFileName, &TAttr);
+  if (TargetExists) {
+    if (!ReplaceIfExists) {
+      return STATUS_OBJECT_NAME_COLLISION;
+    }
+    if ((TAttr & FILE_ATTRIBUTE_DIRECTORY) && !Desc->IsDirectory) {
+      return STATUS_FILE_IS_A_DIRECTORY;
+    }
+    if (!(TAttr & FILE_ATTRIBUTE_DIRECTORY) && Desc->IsDirectory) {
+      return STATUS_ACCESS_DENIED;
+    }
+  }
+
   NTSTATUS R = EnsureUpperParents(NewFileName);
   if (!NT_SUCCESS(R))
     return R;
@@ -1102,24 +1126,51 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   if (!NewUpper)
     return STATUS_NO_MEMORY;
 
-  if (Desc->IsDirectory &&
-      GetFileAttributesW(NewUpper) != INVALID_FILE_ATTRIBUTES)
-    PurgeWhiteoutsRecursive(
-        NewUpper); /* 合并视图保证目标为空, 但 upper 里可能残留 whiteout */
-
-  if (!Desc->UpperExists) {
+  if (Desc->UpperExists) {
+    if (!MoveFileExW(Desc->UpperPath, NewUpper,
+                     (ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0) |
+                         MOVEFILE_WRITE_THROUGH)) {
+      R = W32Err(GetLastError());
+      free(NewUpper);
+      return R;
+    }
+    if (Desc->IsDirectory)
+      PurgeWhiteoutsRecursive(NewUpper, FALSE);
+  } else {
     /* lower-only: 复制到 upper 新名字 + 旧名字打 whiteout (不搬动 lower) */
-    R = EnsureUpperWritable(Desc); /* 目录则只建 upper 目录 */
+    R = EnsureUpperWritable(Desc);
     if (!NT_SUCCESS(R)) {
       free(NewUpper);
       return R;
     }
     if (Desc->IsDirectory) {
-      R = OvlCopyTree(Desc->LowerPath, NewUpper);
+      /* 文件夹: 复制到临时目录 (whiteout) 再改名 */
+      RemoveWhiteout(NewFileName);
+      PWSTR TempDir = WhiteoutPathOf(NewFileName);
+      if (!TempDir) {
+        free(NewUpper);
+        return STATUS_NO_MEMORY;
+      }
+
+      if (!MoveFileExW(Desc->UpperPath, TempDir, MOVEFILE_REPLACE_EXISTING)) {
+        free(TempDir);
+        free(NewUpper);
+        return W32Err(GetLastError());
+      }
+
+      R = OvlCopyTree(Desc->LowerPath, TempDir);
       if (!NT_SUCCESS(R)) {
+        free(TempDir);
         free(NewUpper);
         return R;
       }
+
+      if (!MoveFileExW(TempDir, NewUpper, MOVEFILE_REPLACE_EXISTING)) {
+        free(TempDir);
+        free(NewUpper);
+        return W32Err(GetLastError());
+      }
+      free(TempDir);
     } else {
       /* 文件: EnsureUpperWritable 已把数据复制到 UpperPath; 再改名 */
       if (!MoveFileExW(Desc->UpperPath, NewUpper,
@@ -1130,31 +1181,10 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
         return R;
       }
     }
-    /* [FIX] 必须隐藏 lower 层旧名, 否则改名后旧文件会"复活" */
-    MakeWhiteout(Desc->RelName);
-  } else {
-    /* 目标只存在于 lower 层时, 用 whiteout 压住它 */
-    UINT32 TAttr;
-    if (ReplaceIfExists &&
-        GetFileAttributesW(NewUpper) == INVALID_FILE_ATTRIBUTES &&
-        !WhiteoutExistsAt(NewFileName) && MergedLookup(NewFileName, &TAttr) &&
-        !(TAttr & FILE_ATTRIBUTE_DIRECTORY))
-      MakeWhiteout(NewFileName);
-
-    if (!MoveFileExW(Desc->UpperPath, NewUpper,
-                     (ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0) |
-                         MOVEFILE_WRITE_THROUGH)) {
-      R = W32Err(GetLastError());
-      free(NewUpper);
-      return R;
-    }
-    /* 旧名字若在下层还有条目, 必须隐藏, 防止"复活" */
-    if (Desc->LowerExists)
-      MakeWhiteout(Desc->RelName);
-    else
-      RemoveWhiteout(Desc->RelName);
   }
 
+  if (Desc->LowerExists)
+    MakeWhiteout(Desc->RelName);
   RemoveWhiteout(NewFileName);
   free(Desc->UpperPath);
   Desc->UpperPath = NewUpper;

@@ -139,18 +139,20 @@ static VOID FreeDesc(OVL_DESC *Desc) {
   free(Desc);
 }
 
-static OVL_DESC *AllocDesc(PCWSTR Rel, PCWSTR Upper,
-                           PWSTR Lower /* 转移所有权 */, HANDLE Handle,
+static OVL_DESC *AllocDesc(PCWSTR Rel, PWSTR Upper, PWSTR Lower, HANDLE Handle,
                            BOOLEAN IsDir, BOOLEAN UpExists, BOOLEAN LoExists) {
   OVL_DESC *d = calloc(1, sizeof *d);
-  if (!d) {
-    if (Lower)
-      free(Lower);
+  PWSTR RelName = StrDup(Rel);
+  if (!d || !RelName) {
+    free(d);
+    free(RelName);
+    free(Upper);
+    free(Lower);
     return 0;
   }
   d->Handle = Handle;
-  d->RelName = StrDup(Rel);
-  d->UpperPath = StrDup(Upper);
+  d->RelName = RelName;
+  d->UpperPath = Upper;
   d->LowerPath = Lower;
   d->IsDirectory = IsDir;
   d->UpperExists = UpExists;
@@ -465,11 +467,14 @@ static NTSTATUS CopyUpPath(PCWSTR Lower, PCWSTR Upper) {
     }
   if (!Cu) {
     Cu = calloc(1, sizeof *Cu);
-    if (!Cu) {
+    PWSTR Path = StrDup(Upper);
+    if (!Cu || !Path) {
+      free(Cu);
+      free(Path);
       LeaveCriticalSection(&g_CopyUpCs);
       return STATUS_NO_MEMORY;
     }
-    Cu->Path = StrDup(Upper);
+    Cu->Path = Path;
     Cu->Event = CreateEventW(0, TRUE, FALSE, 0);
     Cu->Refs = 1;
     Cu->Next = g_CopyUps;
@@ -741,7 +746,6 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
   PWSTR lower = 0;
   BOOLEAN LowerExists = FindLowerPath(FileName, &lower);
   OVL_DESC *d = AllocDesc(FileName, up, lower, h, IsDir, TRUE, LowerExists);
-  free(up);
   if (!d) {
     CloseHandle(h);
     return STATUS_NO_MEMORY;
@@ -829,7 +833,6 @@ static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
 
   OVL_DESC *d = AllocDesc(FileName, up, lower, h, IsDir2, UpperExists || Copied,
                           LowerExists);
-  free(up);
   if (!d) {
     CloseHandle(h);
     return STATUS_NO_MEMORY;
@@ -887,10 +890,6 @@ static NTSTATUS OvlOverwrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                               : (cur | FileAttributes));
   }
 
-  PWSTR tmp = 0;
-  Desc->LowerExists = FindLowerPath(Desc->RelName, &tmp);
-  if (tmp)
-    free(tmp);
   GetFileInfoFromHandle(Desc->Handle, FileInfo);
   return STATUS_SUCCESS;
 }
@@ -1060,42 +1059,85 @@ static NTSTATUS OvlSetFileSize(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
-/* 递归复制目录树 (用于改名 lower-only 目录) */
-static NTSTATUS OvlCopyTree(PCWSTR SrcDir, PCWSTR DstDir) {
-  if (!CreateDirectoryW(DstDir, 0) && GetLastError() != ERROR_ALREADY_EXISTS)
-    return W32Err(GetLastError());
-  CopyFileMeta(SrcDir, DstDir);
-  PWSTR Pat = StrCat2(SrcDir, L"\\*");
-  if (!Pat)
+/* 递归把 lower 目录树 copy-up 到 upper */
+static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
+  PWSTR lower = 0;
+  if (!FindLowerPath(Rel, &lower))
+    return STATUS_SUCCESS;
+
+  if (WhiteoutExistsAt(Rel)) {
+    free(lower);
+    return STATUS_SUCCESS;
+  }
+
+  PWSTR upper = StrCat2(g_UpperRoot, Rel);
+  if (!upper) {
+    free(lower);
     return STATUS_NO_MEMORY;
+  }
+
+  DWORD attr = GetFileAttributesW(upper);
+  if (attr != INVALID_FILE_ATTRIBUTES) {
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+      free(upper);
+      free(lower);
+      return STATUS_SUCCESS;
+    }
+  } else {
+    DWORD lattr = GetFileAttributesW(lower);
+    if (lattr == INVALID_FILE_ATTRIBUTES) {
+      free(upper);
+      free(lower);
+      return W32Err(GetLastError());
+    }
+    if (!(lattr & FILE_ATTRIBUTE_DIRECTORY)) {
+      NTSTATUS R = CopyFileRaw(lower, upper);
+      free(upper);
+      free(lower);
+      return R;
+    }
+  }
+
+  if (!CreateDirectoryW(upper, 0) && GetLastError() != ERROR_ALREADY_EXISTS) {
+    free(upper);
+    free(lower);
+    return W32Err(GetLastError());
+  }
+  CopyFileMeta(lower, upper);
+  PWSTR Pat = StrCat2(lower, L"\\*");
+  if (!Pat) {
+    free(upper);
+    free(lower);
+    return STATUS_NO_MEMORY;
+  }
   WIN32_FIND_DATAW Fd;
   HANDLE F = FindFirstFileExW(Pat, FindExInfoBasic, &Fd, FindExSearchNameMatch,
                               0, FIND_FIRST_EX_LARGE_FETCH);
   free(Pat);
-  if (F == INVALID_HANDLE_VALUE)
+  if (F == INVALID_HANDLE_VALUE) {
+    free(upper);
+    free(lower);
     return W32Err(GetLastError());
+  }
+
   NTSTATUS R = STATUS_SUCCESS;
   do {
     if (wcscmp(Fd.cFileName, L".") == 0 || wcscmp(Fd.cFileName, L"..") == 0)
       continue;
-    PWSTR S = StrCat3(SrcDir, L"\\", Fd.cFileName);
-    PWSTR D = StrCat3(DstDir, L"\\", Fd.cFileName);
-    if (!S || !D) {
-      free(S);
-      free(D);
+    PWSTR ChildRel = StrCat3(Rel, L"\\", Fd.cFileName);
+    if (!ChildRel) {
       R = STATUS_NO_MEMORY;
       break;
     }
-    if (Fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-      R = OvlCopyTree(S, D);
-    else
-      R = CopyFileRaw(S, D);
-    free(S);
-    free(D);
+    R = EnsureUpperRecursive(ChildRel);
+    free(ChildRel);
     if (!NT_SUCCESS(R))
       break;
   } while (FindNextFileW(F, &Fd));
   FindClose(F);
+
+  free(upper);
+  free(lower);
   return R;
 }
 
@@ -1107,15 +1149,10 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   OVL_DESC *Desc = FileContext;
 
   UINT32 TAttr;
-  BOOLEAN TargetExists = MergedLookup(NewFileName, &TAttr);
-  if (TargetExists) {
-    if (!ReplaceIfExists) {
+  if (MergedLookup(NewFileName, &TAttr)) {
+    if (Desc->IsDirectory || !ReplaceIfExists) {
       return STATUS_OBJECT_NAME_COLLISION;
-    }
-    if ((TAttr & FILE_ATTRIBUTE_DIRECTORY) && !Desc->IsDirectory) {
-      return STATUS_FILE_IS_A_DIRECTORY;
-    }
-    if (!(TAttr & FILE_ATTRIBUTE_DIRECTORY) && Desc->IsDirectory) {
+    } else if (TAttr & FILE_ATTRIBUTE_DIRECTORY) {
       return STATUS_ACCESS_DENIED;
     }
   }
@@ -1128,74 +1165,53 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   if (!NewUpper)
     return STATUS_NO_MEMORY;
 
-  if (Desc->UpperExists) {
-    if (!MoveFileExW(Desc->UpperPath, NewUpper,
-                     (ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0) |
-                         MOVEFILE_WRITE_THROUGH)) {
-      R = W32Err(GetLastError());
-      free(NewUpper);
-      return R;
-    }
-    if (Desc->IsDirectory)
-      PurgeWhiteoutsRecursive(NewUpper, FALSE);
-  } else {
-    /* lower-only: 复制到 upper 新名字 + 旧名字打 whiteout (不搬动 lower) */
-    R = EnsureUpperWritable(Desc);
+  /* 先把 Lower 中混合的文件全部递归 Copy-Up 到 Upper，避免 Rename 时丢失 */
+  if (Desc->LowerExists && !(Desc->UpperExists && !Desc->IsDirectory)) {
+    R = EnsureUpperRecursive(Desc->RelName);
     if (!NT_SUCCESS(R)) {
       free(NewUpper);
       return R;
     }
-    if (Desc->IsDirectory) {
-      /* 文件夹: 复制到临时目录 (whiteout) 再改名 */
-      RemoveWhiteout(NewFileName);
-      PWSTR TempDir = WhiteoutPathOf(NewFileName);
-      if (!TempDir) {
-        free(NewUpper);
-        return STATUS_NO_MEMORY;
-      }
+    Desc->UpperExists = TRUE;
+  }
 
-      if (!MoveFileExW(Desc->UpperPath, TempDir, MOVEFILE_REPLACE_EXISTING)) {
-        free(TempDir);
-        free(NewUpper);
-        return W32Err(GetLastError());
-      }
+  if (GetFileAttributesW(NewUpper) != INVALID_FILE_ATTRIBUTES)
+    PurgeWhiteoutsRecursive(NewUpper, TRUE);
 
-      R = OvlCopyTree(Desc->LowerPath, TempDir);
-      if (!NT_SUCCESS(R)) {
-        free(TempDir);
-        free(NewUpper);
-        return R;
-      }
-
-      if (!MoveFileExW(TempDir, NewUpper, MOVEFILE_REPLACE_EXISTING)) {
-        free(TempDir);
-        free(NewUpper);
-        return W32Err(GetLastError());
-      }
-      free(TempDir);
-    } else {
-      /* 文件: EnsureUpperWritable 已把数据复制到 UpperPath; 再改名 */
-      if (!MoveFileExW(Desc->UpperPath, NewUpper,
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        R = W32Err(GetLastError());
-        DeleteFileW(Desc->UpperPath); /* 清理 copy-up 残留 */
-        free(NewUpper);
-        return R;
-      }
-    }
+  if (!MoveFileExW(Desc->UpperPath, NewUpper,
+                   (ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0) |
+                       MOVEFILE_WRITE_THROUGH)) {
+    R = W32Err(GetLastError());
+    free(NewUpper);
+    return R;
   }
 
   if (Desc->LowerExists)
     MakeWhiteout(Desc->RelName);
   RemoveWhiteout(NewFileName);
+
   free(Desc->UpperPath);
   Desc->UpperPath = NewUpper;
+
+  NewFileName = StrDup(NewFileName);
+  if (!NewFileName)
+    return STATUS_NO_MEMORY;
   free(Desc->RelName);
-  Desc->RelName = StrDup(NewFileName);
-  PWSTR tmp = 0;
-  Desc->LowerExists = FindLowerPath(NewFileName, &tmp);
-  if (tmp)
-    free(tmp);
+  Desc->RelName = NewFileName;
+
+  free(Desc->LowerPath);
+  Desc->LowerExists = FindLowerPath(NewFileName, &Desc->LowerPath);
+  if (!Desc->LowerExists)
+    Desc->LowerPath = 0;
+
+  CloseHandle(Desc->Handle);
+  HANDLE Nh = OpenUnderlying(NewUpper, Desc->IsDirectory, TRUE, 0);
+  if (Nh == INVALID_HANDLE_VALUE) {
+    R = W32Err(GetLastError());
+    return R;
+  }
+  Desc->Handle = Nh;
+
   return STATUS_SUCCESS;
 }
 
@@ -1219,8 +1235,7 @@ static NTSTATUS OvlEnumLayer(PWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
   NTSTATUS R = STATUS_SUCCESS;
   do {
     if (IsUpper &&
-        wcsncmp(Fd.cFileName, WHITEOUT_PREFIX, WHITEOUT_PREFIX_LEN) == 0 &&
-        Fd.cFileName[WHITEOUT_PREFIX_LEN]) {
+        wcsncmp(Fd.cFileName, WHITEOUT_PREFIX, WHITEOUT_PREFIX_LEN) == 0) {
       /* whiteout: 登记被隐藏的名字, 不输出 */
       char ns = NameSetInsert(Set, Fd.cFileName + WHITEOUT_PREFIX_LEN);
       if (ns == -1) {
@@ -1257,11 +1272,11 @@ static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   (void)Fs;
   (void)Pattern; /* FSD 自行做通配符匹配 */
   OVL_DESC *Desc = FileContext;
-  NTSTATUS Result = STATUS_SUCCESS;
+  NTSTATUS R = STATUS_SUCCESS;
   BOOLEAN Reset = (0 == Marker);
 
-  if (!FspFileSystemAcquireDirectoryBuffer(&Desc->DirBuffer, Reset, &Result))
-    return Result;
+  if (!FspFileSystemAcquireDirectoryBuffer(&Desc->DirBuffer, Reset, &R))
+    return R;
 
   if (Reset) {
     NAMESET Set;
@@ -1269,11 +1284,9 @@ static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
       FspFileSystemReleaseDirectoryBuffer(&Desc->DirBuffer);
       return STATUS_NO_MEMORY;
     }
-    Result =
-        OvlEnumLayer(Desc->UpperPath, TRUE, &Set, &Desc->DirBuffer, &Result);
-    if (NT_SUCCESS(Result) && Desc->LowerPath)
-      Result =
-          OvlEnumLayer(Desc->LowerPath, FALSE, &Set, &Desc->DirBuffer, &Result);
+    R = OvlEnumLayer(Desc->UpperPath, TRUE, &Set, &Desc->DirBuffer, &R);
+    if (NT_SUCCESS(R) && Desc->LowerPath)
+      R = OvlEnumLayer(Desc->LowerPath, FALSE, &Set, &Desc->DirBuffer, &R);
     NameSetFree(&Set);
   }
 

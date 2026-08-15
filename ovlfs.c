@@ -1,10 +1,10 @@
 ﻿/*
- * ovlfs.c - 高性能 WinFsp OverlayFS（upper 可写层 + 多个 lower 只读层）
+ * ovlfs.c - 高性能 WinFsp OverlayFS（upper 可写层 + lower 只读层）
  *
  * 语义:
- *   - 读: upper 优先, 其次 lower[0], lower[1] ...
+ *   - 读: upper 优先, 其次 lower
  *   - 写: 首次以写方式打开时 copy-up 到 upper; 之后所有修改都在 upper
- *   - 删除/改名: lower 层条目用 upper 层中的 ":.<名字>" 隐藏 (whiteout)
+ *   - 删除/改名: lower 层条目用 upper 层中的 "<whiteout><名字>" 隐藏
  *   - 不实现: ACL/安全描述符(NULL DACL)、EA、命名流、重解析点、硬链接
  *
  * 编译 (VS 开发者命令行):
@@ -12,7 +12,7 @@
  * /LIBPATH:"%ProgramFiles(x86)%\WinFsp\lib" winfsp-x64.lib
  *
  * 运行:
- *   ovlfs -u C:\ovl\upper -l C:\base1;C:\base2 -m O: [-i 1000] [-t 0] [-D 1]
+ *   ovlfs -u C:\upper -l C:\lower -m O: [-i 1000] [-t 0] [-D 1]
  */
 
 #define WIN32_NO_STATUS
@@ -38,16 +38,14 @@
 #define WHITEOUT_PREFIX_LEN 2
 #define COPY_BUF_SIZE (1024 * 1024)
 #define ALLOC_UNIT ((UINT64)512 * 8)
-#define MAX_LOWER_LAYERS 8
 
 /* ------------------------------------------------------------------ */
 /* 全局状态                                                            */
 /* ------------------------------------------------------------------ */
 
 static WCHAR g_UpperRoot[MAX_PATH];
-static WCHAR g_LowerRoots[MAX_LOWER_LAYERS][MAX_PATH];
-static ULONG g_LowerCount;
-static WCHAR g_Label[32] = L"OVLFS";
+static WCHAR g_LowerRoot[MAX_PATH];
+static WCHAR g_Label[32] = L"OverlayFS";
 static UINT64 g_AllocUnit = ALLOC_UNIT;
 static HANDLE g_StopEvent;
 static CRITICAL_SECTION g_CopyUpCs;
@@ -91,8 +89,8 @@ static PWSTR StrCat2(PCWSTR a, PCWSTR b) {
   SIZE_T la = wcslen(a), lb = wcslen(b);
   PWSTR p = malloc((la + lb + 1) * sizeof(WCHAR));
   if (p) {
-    memcpy(p, a, la * 2);
-    memcpy(p + la, b, (lb + 1) * 2);
+    memcpy(p, a, la * sizeof(WCHAR));
+    memcpy(p + la, b, (lb + 1) * sizeof(WCHAR));
   }
   return p;
 }
@@ -101,9 +99,9 @@ static PWSTR StrCat3(PCWSTR a, PCWSTR b, PCWSTR c) {
   SIZE_T la = wcslen(a), lb = wcslen(b), lc = wcslen(c);
   PWSTR p = malloc((la + lb + lc + 1) * sizeof(WCHAR));
   if (p) {
-    memcpy(p, a, la * 2);
-    memcpy(p + la, b, lb * 2);
-    memcpy(p + la + lb, c, (lc + 1) * 2);
+    memcpy(p, a, la * sizeof(WCHAR));
+    memcpy(p + la, b, lb * sizeof(WCHAR));
+    memcpy(p + la + lb, c, (lc + 1) * sizeof(WCHAR));
   }
   return p;
 }
@@ -233,17 +231,13 @@ static VOID SetNormalizedName(HANDLE Handle, PCWSTR RootUsed,
 /* 合并视图查找 / whiteout                                             */
 /* ------------------------------------------------------------------ */
 
-static BOOLEAN FindLowerPath(PCWSTR Rel, PWSTR *PPath) {
-  for (ULONG i = 0; i < g_LowerCount; i++) {
-    PWSTR p = StrCat2(g_LowerRoots[i], Rel);
-    if (!p)
-      continue;
-    if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) {
-      *PPath = p;
-      return TRUE;
-    }
-    free(p);
+static BOOLEAN FindLowerPath(PCWSTR Rel, PWSTR *Path) {
+  PWSTR p = StrCat2(g_LowerRoot, Rel);
+  if (p && GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) {
+    *Path = p;
+    return TRUE;
   }
+  free(p);
   return FALSE;
 }
 
@@ -278,10 +272,10 @@ static VOID MakeWhiteout(PCWSTR Rel); /* 前向声明 */
 static NTSTATUS EnsureUpperParents(PCWSTR Rel);
 
 static BOOLEAN MergedLookup(PCWSTR Rel, PUINT32 PAttr) {
-  PWSTR up = StrCat2(g_UpperRoot, Rel);
-  if (up) {
-    DWORD a = GetFileAttributesW(up);
-    free(up);
+  PWSTR Upper = StrCat2(g_UpperRoot, Rel);
+  if (Upper) {
+    DWORD a = GetFileAttributesW(Upper);
+    free(Upper);
     if (a != INVALID_FILE_ATTRIBUTES) {
       *PAttr = a;
       return TRUE;
@@ -289,11 +283,14 @@ static BOOLEAN MergedLookup(PCWSTR Rel, PUINT32 PAttr) {
   }
   if (WhiteoutExistsAt(Rel))
     return FALSE;
-  PWSTR lp;
-  if (FindLowerPath(Rel, &lp)) {
-    *PAttr = GetFileAttributesW(lp);
-    free(lp);
-    return TRUE;
+  PWSTR Lower = StrCat2(g_LowerRoot, Rel);
+  if (Lower) {
+    DWORD a = GetFileAttributesW(Lower);
+    free(Lower);
+    if (a != INVALID_FILE_ATTRIBUTES) {
+      *PAttr = a;
+      return TRUE;
+    }
   }
   return FALSE;
 }
@@ -326,27 +323,27 @@ static VOID CopyFileMeta(PCWSTR Src, PCWSTR Dst) {
 }
 
 static NTSTATUS EnsureUpperDir(PCWSTR Rel) {
-  PWSTR up = StrCat2(g_UpperRoot, Rel);
-  if (!up)
+  PWSTR Upper = StrCat2(g_UpperRoot, Rel);
+  if (!Upper)
     return STATUS_NO_MEMORY;
-  if (GetFileAttributesW(up) != INVALID_FILE_ATTRIBUTES) {
-    free(up);
+  if (GetFileAttributesW(Upper) != INVALID_FILE_ATTRIBUTES) {
+    free(Upper);
     return STATUS_SUCCESS;
   }
-  PWSTR lp;
-  if (!FindLowerPath(Rel, &lp)) {
-    free(up);
+  PWSTR Lower;
+  if (!FindLowerPath(Rel, &Lower)) {
+    free(Upper);
     return STATUS_OBJECT_PATH_NOT_FOUND;
   }
-  if (!CreateDirectoryW(up, 0) && GetLastError() != ERROR_ALREADY_EXISTS) {
+  if (!CreateDirectoryW(Upper, 0) && GetLastError() != ERROR_ALREADY_EXISTS) {
     NTSTATUS R = W32Err(GetLastError());
-    free(up);
-    free(lp);
+    free(Upper);
+    free(Lower);
     return R;
   }
-  CopyFileMeta(lp, up);
-  free(up);
-  free(lp);
+  CopyFileMeta(Lower, Upper);
+  free(Upper);
+  free(Lower);
   return STATUS_SUCCESS;
 }
 
@@ -539,7 +536,7 @@ static VOID MakeWhiteout(PCWSTR Rel) {
 }
 
 /* 递归删除 upper 目录树中的所有文件或 whiteout */
-static VOID PurgeWhiteoutsRecursive(PWSTR DirPath, BOOLEAN All) {
+static VOID PurgeWhiteoutsRecursive(PCWSTR DirPath, BOOLEAN All) {
   PWSTR Pat = StrCat2(DirPath, L"\\*");
   if (!Pat)
     return;
@@ -582,6 +579,51 @@ static VOID RemoveWhiteout(PCWSTR Rel) {
     DeleteFileW(wp);
   }
   free(wp);
+}
+
+/* 递归创建目录中的 whiteout */
+static NTSTATUS CreateWhiteoutsRecursive(PCWSTR Rel, PCWSTR Upper,
+                                         PCWSTR Lower) {
+  DWORD LowerAttr = GetFileAttributesW(Lower);
+  if (LowerAttr == INVALID_FILE_ATTRIBUTES)
+    return W32Err(GetLastError());
+  DWORD UpperAttr = GetFileAttributesW(Upper);
+  if (UpperAttr == INVALID_FILE_ATTRIBUTES) {
+    MakeWhiteout(Rel);
+    return STATUS_SUCCESS;
+  } else if (!(UpperAttr & FILE_ATTRIBUTE_DIRECTORY))
+    return STATUS_SUCCESS;
+
+  PWSTR Pat = StrCat2(Lower, L"\\*");
+  if (!Pat)
+    return STATUS_NO_MEMORY;
+  WIN32_FIND_DATAW Fd;
+  HANDLE F = FindFirstFileExW(Pat, FindExInfoBasic, &Fd, FindExSearchNameMatch,
+                              0, FIND_FIRST_EX_LARGE_FETCH);
+  free(Pat);
+  if (F == INVALID_HANDLE_VALUE)
+    return W32Err(GetLastError());
+
+  NTSTATUS R = STATUS_SUCCESS;
+  do {
+    if (wcscmp(Fd.cFileName, L".") == 0 || wcscmp(Fd.cFileName, L"..") == 0)
+      continue;
+    PWSTR ChildRel = StrCat3(Rel, L"\\", Fd.cFileName);
+    PWSTR ChildUpper = StrCat3(Upper, L"\\", Fd.cFileName);
+    PWSTR ChildLower = StrCat3(Lower, L"\\", Fd.cFileName);
+    if (!ChildRel || !ChildUpper || !ChildLower)
+      R = STATUS_NO_MEMORY;
+    else
+      R = CreateWhiteoutsRecursive(ChildRel, ChildUpper, ChildLower);
+
+    free(ChildRel);
+    free(ChildUpper);
+    free(ChildLower);
+    if (!NT_SUCCESS(R))
+      break;
+  } while (FindNextFileW(F, &Fd));
+  FindClose(F);
+  return R;
 }
 
 /* ------------------------------------------------------------------ */
@@ -679,7 +721,7 @@ static NTSTATUS OvlSetVolumeLabel(FSP_FILE_SYSTEM *Fs, PWSTR VolumeLabel,
 }
 
 /* 不做安全检查: 只报属性 + NULL DACL */
-static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
+static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                                      PUINT32 PFileAttributes,
                                      PSECURITY_DESCRIPTOR SecurityDescriptor,
                                      SIZE_T *PSecurityDescriptorSize) {
@@ -695,7 +737,7 @@ static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
+static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                           UINT32 CreateOptions, UINT32 GrantedAccess,
                           UINT32 FileAttributes,
                           PSECURITY_DESCRIPTOR SecurityDescriptor,
@@ -709,22 +751,22 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
   if (!NT_SUCCESS(R))
     return R;
 
-  PWSTR up = StrCat2(g_UpperRoot, FileName);
-  if (!up)
+  PWSTR Upper = StrCat2(g_UpperRoot, FileName);
+  if (!Upper)
     return STATUS_NO_MEMORY;
 
   HANDLE h;
   if (IsDir) {
-    if (!CreateDirectoryW(up, 0)) {
+    if (!CreateDirectoryW(Upper, 0)) {
       R = W32Err(GetLastError());
-      free(up);
+      free(Upper);
       return R;
     }
     if (FileAttributes)
-      SetFileAttributesW(up, FileAttributes);
-    h = OpenUnderlying(up, TRUE, TRUE, CreateOptions);
+      SetFileAttributesW(Upper, FileAttributes);
+    h = OpenUnderlying(Upper, TRUE, TRUE, CreateOptions);
   } else {
-    h = CreateFileW(up, GENERIC_READ | GENERIC_WRITE,
+    h = CreateFileW(Upper, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0,
                     CREATE_NEW,
                     FileAttributes ? FileAttributes : FILE_ATTRIBUTE_NORMAL, 0);
@@ -737,15 +779,18 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
   }
   if (h == INVALID_HANDLE_VALUE) {
     R = W32Err(GetLastError());
-    free(up);
+    free(Upper);
     return R;
   }
 
   RemoveWhiteout(FileName);
 
-  PWSTR lower = 0;
-  BOOLEAN LowerExists = FindLowerPath(FileName, &lower);
-  OVL_DESC *d = AllocDesc(FileName, up, lower, h, IsDir, TRUE, LowerExists);
+  PWSTR Lower = 0;
+  BOOLEAN LowerExists = FindLowerPath(FileName, &Lower);
+  if (IsDir && LowerExists)
+    CreateWhiteoutsRecursive(FileName, Upper, Lower);
+
+  OVL_DESC *d = AllocDesc(FileName, Upper, Lower, h, IsDir, TRUE, LowerExists);
   if (!d) {
     CloseHandle(h);
     return STATUS_NO_MEMORY;
@@ -756,71 +801,71 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
+static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                         UINT32 CreateOptions, UINT32 GrantedAccess,
                         PVOID *PFileContext, FSP_FSCTL_FILE_INFO *FileInfo) {
   (void)Fs;
   BOOLEAN Writable =
       (GrantedAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA |
                         FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0;
-  PWSTR up = StrCat2(g_UpperRoot, FileName);
-  if (!up)
+  PWSTR Upper = StrCat2(g_UpperRoot, FileName);
+  if (!Upper)
     return STATUS_NO_MEMORY;
 
-  DWORD upAttr = GetFileAttributesW(up);
-  BOOLEAN UpperExists = upAttr != INVALID_FILE_ATTRIBUTES;
-  PWSTR lower = 0;
+  DWORD UpperAttr = GetFileAttributesW(Upper);
+  BOOLEAN UpperExists = UpperAttr != INVALID_FILE_ATTRIBUTES;
+  PWSTR Lower = 0;
   BOOLEAN LowerExists = FALSE;
   HANDLE h = INVALID_HANDLE_VALUE;
   BOOLEAN Copied = FALSE;
   NTSTATUS R;
 
   if (UpperExists) {
-    h = OpenUnderlying(up, (upAttr & FILE_ATTRIBUTE_DIRECTORY) != 0, Writable,
-                       CreateOptions);
+    h = OpenUnderlying(Upper, (UpperAttr & FILE_ATTRIBUTE_DIRECTORY) != 0,
+                       Writable, CreateOptions);
     if (h == INVALID_HANDLE_VALUE) {
       R = W32Err(GetLastError());
-      free(up);
+      free(Upper);
       return R;
     }
-    LowerExists = FindLowerPath(FileName, &lower);
+    LowerExists = FindLowerPath(FileName, &Lower);
   } else {
     if (WhiteoutExistsAt(FileName)) {
-      free(up);
+      free(Upper);
       return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    if (!FindLowerPath(FileName, &lower)) {
-      free(up);
+    if (!FindLowerPath(FileName, &Lower)) {
+      free(Upper);
       return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     LowerExists = TRUE;
-    BOOLEAN IsDir = (GetFileAttributesW(lower) & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    BOOLEAN IsDir = (GetFileAttributesW(Lower) & FILE_ATTRIBUTE_DIRECTORY) != 0;
     if (Writable) {
       /* 写打开 => 立即 copy-up */
       R = EnsureUpperParents(FileName);
       if (NT_SUCCESS(R))
-        R = CopyUpPath(lower, up);
+        R = CopyUpPath(Lower, Upper);
       if (!NT_SUCCESS(R)) {
-        free(up);
-        free(lower);
+        free(Upper);
+        free(Lower);
         return R;
       }
-      h = OpenUnderlying(up, IsDir, TRUE, CreateOptions);
+      h = OpenUnderlying(Upper, IsDir, TRUE, CreateOptions);
       if (h == INVALID_HANDLE_VALUE) {
         R = W32Err(GetLastError());
-        free(up);
-        free(lower);
+        free(Upper);
+        free(Lower);
         return R;
       }
       RemoveWhiteout(FileName);
       Copied = TRUE;
     } else {
       /* 只读打开 => 直接透传 lower 层句柄, 零拷贝 */
-      h = OpenUnderlying(lower, IsDir, FALSE, CreateOptions);
+      h = OpenUnderlying(Lower, IsDir, FALSE, CreateOptions);
       if (h == INVALID_HANDLE_VALUE) {
         R = W32Err(GetLastError());
-        free(up);
-        free(lower);
+        free(Upper);
+        free(Lower);
         return R;
       }
     }
@@ -831,8 +876,8 @@ static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PWSTR FileName,
   if (GetFileInformationByHandle(h, &Bh))
     IsDir2 = (Bh.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
-  OVL_DESC *d = AllocDesc(FileName, up, lower, h, IsDir2, UpperExists || Copied,
-                          LowerExists);
+  OVL_DESC *d = AllocDesc(FileName, Upper, Lower, h, IsDir2,
+                          UpperExists || Copied, LowerExists);
   if (!d) {
     CloseHandle(h);
     return STATUS_NO_MEMORY;
@@ -894,7 +939,7 @@ static NTSTATUS OvlOverwrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
-static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PWSTR FileName,
+static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PCWSTR FileName,
                        ULONG Flags) {
   (void)Fs;
   (void)FileName;
@@ -1061,53 +1106,54 @@ static NTSTATUS OvlSetFileSize(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
 
 /* 递归把 lower 目录树 copy-up 到 upper */
 static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
-  PWSTR lower = 0;
-  if (!FindLowerPath(Rel, &lower))
+  PWSTR Lower = 0;
+  if (!FindLowerPath(Rel, &Lower))
     return STATUS_SUCCESS;
 
   if (WhiteoutExistsAt(Rel)) {
-    free(lower);
+    free(Lower);
     return STATUS_SUCCESS;
   }
 
-  PWSTR upper = StrCat2(g_UpperRoot, Rel);
-  if (!upper) {
-    free(lower);
+  PWSTR Upper = StrCat2(g_UpperRoot, Rel);
+  if (!Upper) {
+    free(Lower);
     return STATUS_NO_MEMORY;
   }
 
-  DWORD attr = GetFileAttributesW(upper);
-  if (attr != INVALID_FILE_ATTRIBUTES) {
-    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-      free(upper);
-      free(lower);
-      return STATUS_SUCCESS;
+  DWORD UpperAttr = GetFileAttributesW(Upper);
+  DWORD LowerAttr = GetFileAttributesW(Lower);
+  if (LowerAttr == INVALID_FILE_ATTRIBUTES) {
+    free(Upper);
+    free(Lower);
+    return W32Err(GetLastError());
+  }
+  if (UpperAttr == INVALID_FILE_ATTRIBUTES) {
+    if (!(LowerAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+      NTSTATUS R = CopyFileRaw(Lower, Upper);
+      free(Upper);
+      free(Lower);
+      return R;
     }
   } else {
-    DWORD lattr = GetFileAttributesW(lower);
-    if (lattr == INVALID_FILE_ATTRIBUTES) {
-      free(upper);
-      free(lower);
-      return W32Err(GetLastError());
-    }
-    if (!(lattr & FILE_ATTRIBUTE_DIRECTORY)) {
-      NTSTATUS R = CopyFileRaw(lower, upper);
-      free(upper);
-      free(lower);
-      return R;
+    if (!(UpperAttr & FILE_ATTRIBUTE_DIRECTORY) ||
+        !(LowerAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+      free(Upper);
+      free(Lower);
+      return STATUS_SUCCESS;
     }
   }
 
-  if (!CreateDirectoryW(upper, 0) && GetLastError() != ERROR_ALREADY_EXISTS) {
-    free(upper);
-    free(lower);
+  if (!CreateDirectoryW(Upper, 0) && GetLastError() != ERROR_ALREADY_EXISTS) {
+    free(Upper);
+    free(Lower);
     return W32Err(GetLastError());
   }
-  CopyFileMeta(lower, upper);
-  PWSTR Pat = StrCat2(lower, L"\\*");
+  CopyFileMeta(Lower, Upper);
+  PWSTR Pat = StrCat2(Lower, L"\\*");
   if (!Pat) {
-    free(upper);
-    free(lower);
+    free(Upper);
+    free(Lower);
     return STATUS_NO_MEMORY;
   }
   WIN32_FIND_DATAW Fd;
@@ -1115,8 +1161,8 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
                               0, FIND_FIRST_EX_LARGE_FETCH);
   free(Pat);
   if (F == INVALID_HANDLE_VALUE) {
-    free(upper);
-    free(lower);
+    free(Upper);
+    free(Lower);
     return W32Err(GetLastError());
   }
 
@@ -1136,13 +1182,13 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
   } while (FindNextFileW(F, &Fd));
   FindClose(F);
 
-  free(upper);
-  free(lower);
+  free(Upper);
+  free(Lower);
   return R;
 }
 
 static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
-                          PWSTR FileName, PWSTR NewFileName,
+                          PCWSTR FileName, PCWSTR NewFileName,
                           BOOLEAN ReplaceIfExists) {
   (void)Fs;
   (void)FileName;
@@ -1175,9 +1221,6 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     Desc->UpperExists = TRUE;
   }
 
-  if (GetFileAttributesW(NewUpper) != INVALID_FILE_ATTRIBUTES)
-    PurgeWhiteoutsRecursive(NewUpper, TRUE);
-
   if (!MoveFileExW(Desc->UpperPath, NewUpper,
                    (ReplaceIfExists ? MOVEFILE_REPLACE_EXISTING : 0) |
                        MOVEFILE_WRITE_THROUGH)) {
@@ -1186,23 +1229,27 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     return R;
   }
 
-  if (Desc->LowerExists)
+  if (Desc->LowerExists) {
     MakeWhiteout(Desc->RelName);
+    PurgeWhiteoutsRecursive(NewUpper, FALSE);
+  }
   RemoveWhiteout(NewFileName);
 
   free(Desc->UpperPath);
   Desc->UpperPath = NewUpper;
 
-  NewFileName = StrDup(NewFileName);
-  if (!NewFileName)
+  PWSTR RelName = StrDup(NewFileName);
+  if (!RelName)
     return STATUS_NO_MEMORY;
   free(Desc->RelName);
-  Desc->RelName = NewFileName;
+  Desc->RelName = RelName;
 
   free(Desc->LowerPath);
-  Desc->LowerExists = FindLowerPath(NewFileName, &Desc->LowerPath);
+  Desc->LowerExists = FindLowerPath(Desc->RelName, &Desc->LowerPath);
   if (!Desc->LowerExists)
     Desc->LowerPath = 0;
+  else if (Desc->IsDirectory)
+    CreateWhiteoutsRecursive(Desc->RelName, Desc->UpperPath, Desc->LowerPath);
 
   CloseHandle(Desc->Handle);
   HANDLE Nh = OpenUnderlying(NewUpper, Desc->IsDirectory, TRUE, 0);
@@ -1215,7 +1262,7 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS OvlEnumLayer(PWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
+static NTSTATUS OvlEnumLayer(PCWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
                              PVOID *PDirBuf, PNTSTATUS PResult) {
   /* [FIX] upper 侧目录物理不存在 (lower-only 目录) 时按空目录处理 */
   DWORD A = GetFileAttributesW(DirPath);
@@ -1297,7 +1344,7 @@ static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
 }
 
 static NTSTATUS OvlGetDirInfoByName(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
-                                    PWSTR FileName,
+                                    PCWSTR FileName,
                                     FSP_FSCTL_DIR_INFO *DirInfo) {
   (void)Fs;
   OVL_DESC *Parent = FileContext;
@@ -1306,24 +1353,28 @@ static NTSTATUS OvlGetDirInfoByName(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     return STATUS_NO_MEMORY;
 
   WIN32_FIND_DATAW Fd;
-  HANDLE F = INVALID_HANDLE_VALUE;
-  PWSTR up = StrCat2(g_UpperRoot, ChildRel);
-  if (up) {
-    F = FindFirstFileW(up, &Fd);
-    free(up);
+  PWSTR Upper = StrCat2(g_UpperRoot, ChildRel);
+  if (!Upper) {
+    free(ChildRel);
+    return STATUS_NO_MEMORY;
   }
+  HANDLE F = FindFirstFileW(Upper, &Fd);
+  free(Upper);
+
   if (F == INVALID_HANDLE_VALUE) {
     if (WhiteoutExistsAt(ChildRel)) {
       free(ChildRel);
       return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    PWSTR lp;
-    if (!FindLowerPath(ChildRel, &lp)) {
+
+    PWSTR Lower = StrCat2(g_LowerRoot, ChildRel);
+    if (!Lower) {
       free(ChildRel);
-      return STATUS_OBJECT_NAME_NOT_FOUND;
+      return STATUS_NO_MEMORY;
     }
-    F = FindFirstFileW(lp, &Fd);
-    free(lp);
+    F = FindFirstFileW(Lower, &Fd);
+    free(Lower);
+
     if (F == INVALID_HANDLE_VALUE) {
       free(ChildRel);
       return W32Err(GetLastError());
@@ -1364,14 +1415,13 @@ static BOOL WINAPI CtrlHandler(DWORD Type) {
 }
 
 static VOID Usage(void) {
-  fwprintf(stderr,
-           L"ovlfs - 高性能 WinFsp OverlayFS\n"
-           L"用法: ovlfs -u <upper目录> -l <lower目录>[;<lower2>...] [选项]\n"
-           L"选项:\n"
-           L"  -m <挂载点>   盘符(如 O: 或 O:)或目录; 缺省自动选择\n"
-           L"  -i <毫秒>     内核元数据缓存超时, 0=关闭 (缺省 1000)\n"
-           L"  -t <线程数>   分发线程数, 0=缺省\n"
-           L"  -D <级别>     调试日志级别\n");
+  fwprintf(stderr, L"WinFsp OverlayFS\n"
+                   L"用法: ovlfs -u <顶层目录> -l <底层目录> [选项]\n"
+                   L"选项:\n"
+                   L"  -m <挂载点>   盘符(如 O: 或 O:)或目录; 缺省自动选择\n"
+                   L"  -i <毫秒>     内核元数据缓存超时, 0=关闭 (缺省 1000)\n"
+                   L"  -t <线程数>   分发线程数, 0=缺省\n"
+                   L"  -D <级别>     调试日志级别\n");
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -1382,17 +1432,23 @@ int wmain(int argc, wchar_t **argv) {
   ULONG InfoTimeout = 1000, Threads = 0, DebugLog = 0;
 
   for (int i = 1; i < argc; i++) {
-    if (wcscmp(argv[i], L"-u") == 0 && i + 1 < argc)
+    if (wcscmp(argv[i], L"-h") == 0) {
+      Usage();
+      return 0;
+    } else if (i + 1 >= argc) {
+      Usage();
+      return 2;
+    } else if (wcscmp(argv[i], L"-u") == 0)
       UpperArg = argv[++i];
-    else if (wcscmp(argv[i], L"-l") == 0 && i + 1 < argc)
+    else if (wcscmp(argv[i], L"-l") == 0)
       LowerArg = argv[++i];
-    else if (wcscmp(argv[i], L"-m") == 0 && i + 1 < argc)
+    else if (wcscmp(argv[i], L"-m") == 0)
       MountPoint = argv[++i];
-    else if (wcscmp(argv[i], L"-i") == 0 && i + 1 < argc)
+    else if (wcscmp(argv[i], L"-i") == 0)
       InfoTimeout = _wtoi(argv[++i]);
-    else if (wcscmp(argv[i], L"-t") == 0 && i + 1 < argc)
+    else if (wcscmp(argv[i], L"-t") == 0)
       Threads = _wtoi(argv[++i]);
-    else if (wcscmp(argv[i], L"-D") == 0 && i + 1 < argc)
+    else if (wcscmp(argv[i], L"-D") == 0)
       DebugLog = _wtoi(argv[++i]);
     else {
       Usage();
@@ -1405,42 +1461,29 @@ int wmain(int argc, wchar_t **argv) {
   }
 
   if (!NormalizeRootDir(UpperArg, g_UpperRoot, MAX_PATH)) {
-    fwprintf(stderr, L"无效的 upper 目录\n");
+    fwprintf(stderr, L"无效的顶层目录\n");
     return 1;
   }
   {
-    WCHAR Probe[MAX_PATH + 16];
-    swprintf_s(Probe, MAX_PATH + 16, L"%s\\__ovlfs_probe__", g_UpperRoot);
+    WCHAR Probe[MAX_PATH];
+    swprintf_s(Probe, MAX_PATH, L"%s\\%s_ovlfs_test", g_UpperRoot,
+               WHITEOUT_PREFIX);
     HANDLE h = CreateFileW(Probe, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_TEMPORARY, 0);
     if (h == INVALID_HANDLE_VALUE) {
-      fwprintf(stderr, L"upper 目录不存在或不可写: %s\n", g_UpperRoot);
+      fwprintf(stderr, L"顶层目录不存在或不可写: %s\n", g_UpperRoot);
       return 1;
     }
     CloseHandle(h);
     DeleteFileW(Probe);
   }
 
-  WCHAR Lowers[MAX_PATH * MAX_LOWER_LAYERS];
-  wcscpy_s(Lowers, MAX_PATH * MAX_LOWER_LAYERS, LowerArg);
-  WCHAR *CtxTok = 0;
-  for (WCHAR *Tok = wcstok_s(Lowers, L";", &CtxTok); Tok;
-       Tok = wcstok_s(0, L";", &CtxTok)) {
-    if (g_LowerCount >= MAX_LOWER_LAYERS)
-      break;
-    if (!NormalizeRootDir(Tok, g_LowerRoots[g_LowerCount], MAX_PATH)) {
-      fwprintf(stderr, L"无效的 lower 目录: %s\n", Tok);
-      return 1;
-    }
-    if (GetFileAttributesW(g_LowerRoots[g_LowerCount]) ==
-        INVALID_FILE_ATTRIBUTES) {
-      fwprintf(stderr, L"lower 目录不存在: %s\n", g_LowerRoots[g_LowerCount]);
-      return 1;
-    }
-    g_LowerCount++;
+  if (!NormalizeRootDir(LowerArg, g_LowerRoot, MAX_PATH)) {
+    fwprintf(stderr, L"无效的底层目录: %s\n", LowerArg);
+    return 1;
   }
-  if (g_LowerCount == 0) {
-    fwprintf(stderr, L"至少需要一个 lower 目录\n");
+  if (GetFileAttributesW(g_LowerRoot) == INVALID_FILE_ATTRIBUTES) {
+    fwprintf(stderr, L"底层目录不存在: %s\n", g_LowerRoot);
     return 1;
   }
 
@@ -1477,7 +1520,7 @@ int wmain(int argc, wchar_t **argv) {
   Vp.AllowOpenInKernelMode = 0;
   Vp.PostDispositionWhenNecessaryOnly = 1;
   wcscpy_s(Vp.FileSystemName,
-           sizeof Vp.FileSystemName / sizeof Vp.FileSystemName[0], L"OVLFS");
+           sizeof Vp.FileSystemName / sizeof Vp.FileSystemName[0], L"OverlayFS");
 
   static FSP_FILE_SYSTEM_INTERFACE Iface;
   memset(&Iface, 0, sizeof Iface);
@@ -1525,8 +1568,8 @@ int wmain(int argc, wchar_t **argv) {
     FspFileSystemSetDebugLog(FileSystem, DebugLog);
 
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
-  wprintf(L"OVLFS 已挂载: %s (upper=%s, %lu 个 lower 层) -- Ctrl+C 卸载退出\n",
-          FspFileSystemMountPoint(FileSystem), g_UpperRoot, g_LowerCount);
+  wprintf(L"OverlayFS 已挂载: %s (顶层: %s, 底层: %s)\n",
+          FspFileSystemMountPoint(FileSystem), g_UpperRoot, g_LowerRoot);
   fflush(stdout);
 
   WaitForSingleObject(g_StopEvent, INFINITE);
@@ -1534,6 +1577,6 @@ int wmain(int argc, wchar_t **argv) {
   FspFileSystemStopDispatcher(FileSystem);
   FspFileSystemRemoveMountPoint(FileSystem);
   FspFileSystemDelete(FileSystem);
-  wprintf(L"OVLFS 已卸载\n");
+  wprintf(L"OverlayFS 已卸载\n");
   return 0;
 }

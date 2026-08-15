@@ -612,13 +612,12 @@ static VOID NameSetFree(NAMESET *Set) {
   free(Set->Items);
 }
 
-static BOOLEAN NameSetInsert(NAMESET *Set, PCWSTR Name) /* TRUE=已存在 */
-{
+static char NameSetInsert(NAMESET *Set, PCWSTR Name) {
   if ((Set->Count + 1) * 10 >= Set->Capacity * 7) {
     ULONG NewCap = Set->Capacity * 2;
     PWSTR *New = calloc(NewCap, sizeof(PWSTR));
     if (!New)
-      return TRUE;
+      return -1;
     for (ULONG i = 0; i < Set->Capacity; i++) {
       PWSTR e = Set->Items[i];
       if (!e)
@@ -636,12 +635,15 @@ static BOOLEAN NameSetInsert(NAMESET *Set, PCWSTR Name) /* TRUE=已存在 */
   for (;;) {
     PWSTR e = Set->Items[i];
     if (!e) {
-      Set->Items[i] = StrDup(Name);
+      PWSTR Dup = StrDup(Name);
+      if (!Dup)
+        return -1;
+      Set->Items[i] = Dup;
       Set->Count++;
-      return FALSE;
+      return 0;
     }
     if (_wcsicmp(e, Name) == 0)
-      return TRUE;
+      return 1;
     i = (i + 1) & (Set->Capacity - 1);
   }
 }
@@ -1220,10 +1222,18 @@ static NTSTATUS OvlEnumLayer(PWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
         wcsncmp(Fd.cFileName, WHITEOUT_PREFIX, WHITEOUT_PREFIX_LEN) == 0 &&
         Fd.cFileName[WHITEOUT_PREFIX_LEN]) {
       /* whiteout: 登记被隐藏的名字, 不输出 */
-      NameSetInsert(Set, Fd.cFileName + WHITEOUT_PREFIX_LEN);
+      char ns = NameSetInsert(Set, Fd.cFileName + WHITEOUT_PREFIX_LEN);
+      if (ns == -1) {
+        R = STATUS_NO_MEMORY;
+        break;
+      }
       continue;
     }
-    if (NameSetInsert(Set, Fd.cFileName))
+    char ns = NameSetInsert(Set, Fd.cFileName);
+    if (ns == -1) {
+      R = STATUS_NO_MEMORY;
+      break;
+    } else if (ns == 1)
       continue; /* upper 或前一个 lower 优先 */
 
     FSP_FSCTL_DIR_INFO Di;

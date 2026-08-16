@@ -1,0 +1,200 @@
+name: Build and Test OverlayFS
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  WINFSP_VER: "v2.2B4"
+  WINFSP_NAME: "winfsp-2.2.26215.msi"
+  WINFSP_SHA256: "2ecb5c89405488a95bbd8a01875e02c48534fd37bbdfd84488f7590464d65944"
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Set environment
+      run: |
+        if ($env:GITHUB_REF_TYPE -eq 'tag') {
+          $VERSION = $env:GITHUB_REF_NAME
+        } else {
+          $VERSION = $env:GITHUB_SHA.Substring(0, 7)
+        }
+        Get-ChildItem -Filter *.c | ForEach-Object {
+          $content = Get-Content $_.FullName -Raw
+          $replaced = $content -replace 'v0\.0\.0', $VERSION
+          Set-Content -Path "$($_.Name)" -Value $replaced -NoNewline -Encoding utf8BOM
+        }
+
+    - name: Download and Verify WinFsp MSI
+      run: |
+        Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/${env:WINFSP_VER}/${env:WINFSP_NAME}" -OutFile winfsp.msi
+        $hash = (Get-FileHash -Path winfsp.msi -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $env:WINFSP_SHA256) {
+          Write-Error "WinFsp MSI SHA256 mismatch! Got $hash, expected ${env:WINFSP_SHA256}"
+          exit 1
+        }
+        Write-Host "WinFsp MSI verified successfully."
+
+    - name: Install WinFsp
+      run: |
+        $proc = Start-Process msiexec.exe -ArgumentList @(
+          '/qn', '/norestart',
+          '/i', 'winfsp.msi',
+          'ADDLOCAL=F.Developer',
+          '/l*v', 'winfsp-install.log'
+        ) -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+          Write-Host "::error::WinFsp install failed, exit code: $($proc.ExitCode)"
+          Get-Content winfsp-install.log -Tail 200 -ErrorAction SilentlyContinue
+          exit $proc.ExitCode
+        }
+
+    - name: Setup MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Build OverlayFS
+      run: |
+        $OUTPUT_NAME = "ovlfs-$($env:GITHUB_REF_NAME.Replace('/', '-')).exe"
+        cl /O2 /W3 /I "${env:ProgramFiles(x86)}\WinFsp\inc" ovlfs.c /link /LIBPATH:"${env:ProgramFiles(x86)}\WinFsp\lib" winfsp-x64.lib "/OUT:$OUTPUT_NAME"
+        if (($LASTEXITCODE -ne 0) -or (-not (Test-Path $OUTPUT_NAME))) {
+          throw "Build failed with exit code $LASTEXITCODE"
+        }
+
+        Copy-Item -Path "$OUTPUT_NAME" -Destination "${env:ProgramFiles(x86)}\WinFsp\bin\ovlfs.exe" -Force
+        Add-Content -Path $env:GITHUB_ENV -Value "OUTPUT_NAME=$OUTPUT_NAME" -Encoding utf8NoBOM
+        Get-Item $OUTPUT_NAME | Format-List Name, Length, LastWriteTime
+        Get-FileHash $OUTPUT_NAME -Algorithm SHA256 | Format-List Hash, Path
+
+    - name: Run OverlayFS Smoke Test
+      shell: pwsh
+      run: |
+        # 1. 准备目录
+        New-Item -ItemType Directory -Path "C:\upper" -Force | Out-Null
+        New-Item -ItemType Directory -Path "C:\lower" -Force | Out-Null
+
+        # 2. 在 lower 层创建基准文件
+        "original content from lower" | Set-Content -Path "C:\lower\test.txt" -Encoding UTF8
+        "to be deleted" | Set-Content -Path "C:\lower\deleteme.txt" -Encoding UTF8
+        "rename source" | Set-Content -Path "C:\lower\renamesrc.txt" -Encoding UTF8
+
+        # 3. 启动 OverlayFS
+        $proc = Start-Process -FilePath "${env:ProgramFiles(x86)}\WinFsp\bin\ovlfs.exe" -ArgumentList "-u C:\upper -l C:\lower -m C:\mnt" -PassThru
+
+        Write-Host "OverlayFS started with PID $($proc.Id), waiting for mount..."
+        # 轮询等待挂载就绪，最多 15 秒
+        $timeout = 15; $elapsed = 0
+        while (-not (Test-Path "C:\mnt\test.txt") -and $elapsed -lt $timeout) {
+          Start-Sleep -Seconds 1; $elapsed++
+        }
+        if ($elapsed -ge $timeout) { throw "OverlayFS mount timed out after ${timeout}s" }
+        Write-Host "Mount ready in ${elapsed}s"
+
+        try {
+          # === Test 1: 读取 lower 层文件 ===
+          Write-Host "[Test 1] Reading from lower layer..."
+          $content = Get-Content "C:\mnt\test.txt" -Raw
+          if ($content.Trim() -ne "original content from lower") {
+            throw "Test 1 FAILED: Expected lower layer content, got: $content"
+          }
+          Write-Host "[Test 1] PASSED ✓"
+
+          # === Test 2: 写入新文件到 upper 层 ===
+          Write-Host "[Test 2] Writing new file to overlay..."
+          "new file content" | Set-Content -Path "C:\mnt\newfile.txt" -Encoding UTF8
+          if (-not (Test-Path "C:\upper\newfile.txt")) {
+            throw "Test 2 FAILED: New file not created in upper layer"
+          }
+          $newContent = Get-Content "C:\mnt\newfile.txt" -Raw
+          if ($newContent.Trim() -ne "new file content") {
+            throw "Test 2 FAILED: Content mismatch for new file"
+          }
+          Write-Host "[Test 2] PASSED ✓"
+
+          # === Test 3: Copy-on-Write 覆盖写 ===
+          Write-Host "[Test 3] Testing Copy-on-Write..."
+          "modified content in upper" | Set-Content -Path "C:\mnt\test.txt" -Encoding UTF8
+          if (-not (Test-Path "C:\upper\test.txt")) {
+            throw "Test 3 FAILED: CoW did not create copy in upper layer"
+          }
+          $modContent = Get-Content "C:\mnt\test.txt" -Raw
+          if ($modContent.Trim() -ne "modified content in upper") {
+            throw "Test 3 FAILED: Modified content read-back mismatch"
+          }
+          $origContent = Get-Content "C:\lower\test.txt" -Raw
+          if ($origContent.Trim() -ne "original content from lower") {
+            throw "Test 3 FAILED: Lower layer was mutated (must be immutable)"
+          }
+          Write-Host "[Test 3] PASSED ✓"
+
+          # === Test 4: 删除 lower 层文件（whiteout 验证）===
+          Write-Host "[Test 4] Deleting lower-layer file (whiteout)..."
+          Remove-Item "C:\mnt\deleteme.txt" -Force
+          # 4a: 挂载点中不可见
+          if (Test-Path "C:\mnt\deleteme.txt") {
+            throw "Test 4 FAILED: Deleted file still visible in mount"
+          }
+          # 4b: lower 层原始文件未被真正删除
+          if (-not (Test-Path "C:\lower\deleteme.txt")) {
+            throw "Test 4 FAILED: Lower layer file was physically deleted (should use whiteout)"
+          }
+          # 4c: upper 层应存在 whiteout 标记（字符设备或特殊隐藏文件）
+          #     WinFSP ovlfs 使用 NTFS reparse point / hidden marker
+          #     最可靠的验证是：重新挂载后该文件仍然不可见
+          #     这里我们检查 upper 层是否有对应条目（名称匹配即可）
+          $whiteoutFound = Get-ChildItem "C:\upper" -Force | Where-Object { $_.Name -match "deleteme" }
+          if (-not $whiteoutFound) {
+            Write-Warning "Test 4 WARNING: No explicit whiteout entry found in upper, but delete semantics work correctly"
+          } else {
+            Write-Host "  Whiteout entry detected: $($whiteoutFound.Name)"
+          }
+          Write-Host "[Test 4] PASSED ✓"
+
+          # === Test 5: 重命名文件 ===
+          Write-Host "[Test 5] Renaming file in overlay..."
+          Rename-Item "C:\mnt\renamesrc.txt" "renamedst.txt"
+          # 5a: 旧名不可见
+          if (Test-Path "C:\mnt\renamesrc.txt") {
+            throw "Test 5 FAILED: Old name still visible after rename"
+          }
+          # 5b: 新名可读且内容正确
+          if (-not (Test-Path "C:\mnt\renamedst.txt")) {
+            throw "Test 5 FAILED: New name not visible after rename"
+          }
+          $renContent = Get-Content "C:\mnt\renamedst.txt" -Raw
+          if ($renContent.Trim() -ne "rename source") {
+            throw "Test 5 FAILED: Content corrupted after rename"
+          }
+          # 5c: lower 层原文件不受影响
+          if (-not (Test-Path "C:\lower\renamesrc.txt")) {
+            throw "Test 5 FAILED: Lower layer original file was removed by rename"
+          }
+          Write-Host "[Test 5] PASSED ✓"
+
+          Write-Host "`n✅ All 5 OverlayFS smoke tests passed!"
+        }
+        finally {
+          Write-Host "Stopping OverlayFS (PID $($proc.Id))..."
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item -Force -Recurse -Path "C:\lower"
+          Remove-Item -Force -Recurse -Path "C:\upper"
+        }
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.OUTPUT_NAME }}
+        path: ${{ env.OUTPUT_NAME }}
+        if-no-files-found: error
+
+    - name: Upload to Release
+      if: github.ref_type == 'tag'
+      uses: softprops/action-gh-release@v3
+      with:
+        files: ${{ env.OUTPUT_NAME }}

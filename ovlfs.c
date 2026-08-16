@@ -1,5 +1,5 @@
 ﻿/*
- * ovlfs.c - 高性能 WinFsp OverlayFS（upper 可写层 + lower 只读层）
+ * ovlfs.c - WinFsp OverlayFS（upper 可写层 + lower 只读层）
  *
  * 语义:
  *   - 读: upper 优先, 其次 lower
@@ -31,7 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OVL_NAME L"OverlayFS v0.0.1"
+#define OVL_NAME L"OverlayFS v0.0.0"
 #define OVL_DISK_DEVICE_NAME L"WinFsp.Disk"
 
 #define WHITEOUT_PREFIX L"\uF03A\uF02E"
@@ -255,9 +255,6 @@ static BOOLEAN WhiteoutExistsAt(PCWSTR Rel) {
   free(wp);
   return b;
 }
-
-static VOID MakeWhiteout(PCWSTR Rel); /* 前向声明 */
-static NTSTATUS EnsureUpperParents(PCWSTR Rel);
 
 /* 在合并视图 (upper 优先，其次 lower) 中查找文件属性 */
 static BOOLEAN MergedLookup(PCWSTR Rel, PUINT32 PAttr) {
@@ -548,7 +545,9 @@ static VOID PurgeWhiteoutsRecursive(PCWSTR DirPath, BOOLEAN All) {
   if (F == INVALID_HANDLE_VALUE)
     return;
   do {
-    if (wcscmp(Fd.cFileName, L".") == 0 || wcscmp(Fd.cFileName, L"..") == 0)
+    if (Fd.cFileName[0] == L'.' &&
+        (Fd.cFileName[1] == L'\0' ||
+         (Fd.cFileName[1] == L'.' && Fd.cFileName[2] == L'\0')))
       continue;
     PWSTR Full = StrCat3(DirPath, L"\\", Fd.cFileName);
     if (!Full)
@@ -608,7 +607,9 @@ static NTSTATUS CreateWhiteoutsRecursive(PCWSTR Rel, PCWSTR Upper,
 
   NTSTATUS R = STATUS_SUCCESS;
   do {
-    if (wcscmp(Fd.cFileName, L".") == 0 || wcscmp(Fd.cFileName, L"..") == 0)
+    if (Fd.cFileName[0] == L'.' &&
+        (Fd.cFileName[1] == L'\0' ||
+         (Fd.cFileName[1] == L'.' && Fd.cFileName[2] == L'\0')))
       continue;
     PWSTR ChildRel = StrCat3(Rel, L"\\", Fd.cFileName);
     PWSTR ChildUpper = StrCat3(Upper, L"\\", Fd.cFileName);
@@ -728,7 +729,75 @@ static NTSTATUS OvlSetVolumeLabel(FSP_FILE_SYSTEM *Fs, PWSTR VolumeLabel,
   return OvlGetVolumeInfo(0, VolumeInfo);
 }
 
-/* 获取文件的安全描述符和属性 (本实现不返回安全描述符，仅返回 NULL DACL) */
+/* 判断文件或目录是否可以被删除（目录需检查合并视图是否为空） */
+static NTSTATUS OvlCanDelete(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
+                             PCWSTR FileName) {
+  (void)Fs;
+  (void)FileName;
+  OVL_DESC *Desc = FileContext;
+
+  if (!Desc->IsDirectory)
+    return STATUS_SUCCESS;
+
+  /* 检查 upper 层是否有可见条目（排除 whiteout 文件） */
+  if (Desc->UpperExists) {
+    PWSTR Pat = StrCat2(Desc->UpperPath, L"\\*");
+    if (!Pat)
+      return STATUS_NO_MEMORY;
+    WIN32_FIND_DATAW Fd;
+    HANDLE F = FindFirstFileExW(Pat, FindExInfoBasic, &Fd,
+                                FindExSearchNameMatch, 0, 0);
+    free(Pat);
+    if (F != INVALID_HANDLE_VALUE) {
+      do {
+        if (Fd.cFileName[0] == L'.' &&
+            (Fd.cFileName[1] == L'\0' ||
+             (Fd.cFileName[1] == L'.' && Fd.cFileName[2] == L'\0')))
+          continue;
+        if (wcsncmp(Fd.cFileName, WHITEOUT_PREFIX, WHITEOUT_PREFIX_LEN) == 0)
+          continue;
+        FindClose(F);
+        return STATUS_DIRECTORY_NOT_EMPTY;
+      } while (FindNextFileW(F, &Fd));
+      FindClose(F);
+    }
+  }
+
+  /* 检查 lower 层是否有未被 whiteout 隐藏的条目 */
+  if (Desc->LowerExists && Desc->LowerPath) {
+    PWSTR Pat = StrCat2(Desc->LowerPath, L"\\*");
+    if (!Pat)
+      return STATUS_NO_MEMORY;
+    WIN32_FIND_DATAW Fd;
+    HANDLE F = FindFirstFileExW(Pat, FindExInfoBasic, &Fd,
+                                FindExSearchNameMatch, 0, 0);
+    free(Pat);
+    if (F != INVALID_HANDLE_VALUE) {
+      do {
+        if (Fd.cFileName[0] == L'.' &&
+            (Fd.cFileName[1] == L'\0' ||
+             (Fd.cFileName[1] == L'.' && Fd.cFileName[2] == L'\0')))
+          continue;
+        PWSTR ChildRel = StrCat3(Desc->RelName, L"\\", Fd.cFileName);
+        if (!ChildRel) {
+          FindClose(F);
+          return STATUS_NO_MEMORY;
+        }
+        BOOLEAN Hidden = WhiteoutExistsAt(ChildRel);
+        free(ChildRel);
+        if (!Hidden) {
+          FindClose(F);
+          return STATUS_DIRECTORY_NOT_EMPTY;
+        }
+      } while (FindNextFileW(F, &Fd));
+      FindClose(F);
+    }
+  }
+
+  return STATUS_SUCCESS;
+}
+
+/* 获取文件的安全描述符和属性 (仅返回 NULL DACL) */
 static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                                      PUINT32 PFileAttributes,
                                      PSECURITY_DESCRIPTOR SecurityDescriptor,
@@ -741,7 +810,7 @@ static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
   if (PFileAttributes)
     *PFileAttributes = Attr;
   if (PSecurityDescriptorSize)
-    *PSecurityDescriptorSize = 0; /* 不返回任何 SD */
+    *PSecurityDescriptorSize = 0;
   return STATUS_SUCCESS;
 }
 
@@ -774,12 +843,6 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
     if (FileAttributes)
       SetFileAttributesW(Upper, FileAttributes);
     h = OpenUnderlying(Upper, TRUE, TRUE, CreateOptions);
-    if (h == INVALID_HANDLE_VALUE) {
-      R = W32Err(GetLastError());
-      RemoveDirectoryW(Upper);
-      free(Upper);
-      return R;
-    }
   } else {
     h = CreateFileW(Upper, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0,
@@ -960,17 +1023,11 @@ static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PCWSTR FileName,
   if (!(Flags & FspCleanupDelete))
     return; /* 时间/归档位等由底层 NTFS 自行维护 */
 
-  if (Desc->Handle != INVALID_HANDLE_VALUE) {
-    CloseHandle(Desc->Handle);
-    Desc->Handle = INVALID_HANDLE_VALUE;
-  }
-
   if (Desc->UpperExists) {
     if (Desc->IsDirectory)
-      if (!RemoveDirectoryW(Desc->UpperPath))
-        return;
-      else if (!DeleteFileW(Desc->UpperPath))
-        return;
+      PurgeWhiteoutsRecursive(Desc->UpperPath, TRUE);
+    else
+      DeleteFileW(Desc->UpperPath);
   }
   if (Desc->LowerExists)
     MakeWhiteout(Desc->RelName);
@@ -1179,7 +1236,9 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
   }
 
   do {
-    if (wcscmp(Fd.cFileName, L".") == 0 || wcscmp(Fd.cFileName, L"..") == 0)
+    if (Fd.cFileName[0] == L'.' &&
+        (Fd.cFileName[1] == L'\0' ||
+         (Fd.cFileName[1] == L'.' && Fd.cFileName[2] == L'\0')))
       continue;
     PWSTR ChildRel = StrCat3(Rel, L"\\", Fd.cFileName);
     if (!ChildRel) {
@@ -1579,6 +1638,7 @@ int wmain(int argc, wchar_t **argv) {
   Iface.GetFileInfo = OvlGetFileInfo;
   Iface.SetBasicInfo = OvlSetBasicInfo;
   Iface.SetFileSize = OvlSetFileSize;
+  Iface.CanDelete = OvlCanDelete;
   Iface.Rename = OvlRename;
   Iface.ReadDirectory = OvlReadDirectory;
   Iface.GetDirInfoByName = OvlGetDirInfoByName;

@@ -33,7 +33,6 @@
 
 #define OVL_NAME L"OverlayFS v0.0.1"
 #define OVL_DISK_DEVICE_NAME L"WinFsp.Disk"
-#define OVL_NET_DEVICE_NAME L"WinFsp.Net"
 
 #define WHITEOUT_PREFIX L"\uF03A\uF02E"
 #define WHITEOUT_PREFIX_LEN 2
@@ -235,7 +234,8 @@ static PWSTR WhiteoutPathOf(PCWSTR Rel) {
     return 0;
   SIZE_T ParentLen = Slash - Rel;
   PCWSTR Leaf = Slash + 1;
-  SIZE_T Total = wcslen(g_UpperRoot) + ParentLen + 5 + wcslen(Leaf) + 1;
+  SIZE_T Total = wcslen(g_UpperRoot) + ParentLen + 1 + WHITEOUT_PREFIX_LEN +
+                 wcslen(Leaf) + 1;
   PWSTR p = malloc(Total * sizeof(WCHAR));
   if (!p)
     return 0;
@@ -249,9 +249,8 @@ static PWSTR WhiteoutPathOf(PCWSTR Rel) {
 /* 检查指定相对路径是否存在 whiteout 标记 */
 static BOOLEAN WhiteoutExistsAt(PCWSTR Rel) {
   PWSTR wp = WhiteoutPathOf(Rel);
-  if (!wp) {
+  if (!wp)
     return FALSE;
-  }
   BOOLEAN b = GetFileAttributesW(wp) != INVALID_FILE_ATTRIBUTES;
   free(wp);
   return b;
@@ -775,6 +774,12 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
     if (FileAttributes)
       SetFileAttributesW(Upper, FileAttributes);
     h = OpenUnderlying(Upper, TRUE, TRUE, CreateOptions);
+    if (h == INVALID_HANDLE_VALUE) {
+      R = W32Err(GetLastError());
+      RemoveDirectoryW(Upper);
+      free(Upper);
+      return R;
+    }
   } else {
     h = CreateFileW(Upper, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0,
@@ -955,11 +960,17 @@ static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PCWSTR FileName,
   if (!(Flags & FspCleanupDelete))
     return; /* 时间/归档位等由底层 NTFS 自行维护 */
 
+  if (Desc->Handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(Desc->Handle);
+    Desc->Handle = INVALID_HANDLE_VALUE;
+  }
+
   if (Desc->UpperExists) {
     if (Desc->IsDirectory)
-      PurgeWhiteoutsRecursive(Desc->UpperPath, TRUE);
-    else
-      DeleteFileW(Desc->UpperPath);
+      if (!RemoveDirectoryW(Desc->UpperPath))
+        return;
+      else if (!DeleteFileW(Desc->UpperPath))
+        return;
   }
   if (Desc->LowerExists)
     MakeWhiteout(Desc->RelName);
@@ -976,8 +987,7 @@ static NTSTATUS OvlRead(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
                         UINT64 Offset, ULONG Length, PULONG PBytesTransferred) {
   (void)Fs;
   OVL_DESC *Desc = FileContext;
-  OVERLAPPED Ov;
-  memset(&Ov, 0, sizeof Ov);
+  OVERLAPPED Ov = {0};
   Ov.Offset = (DWORD)Offset;
   Ov.OffsetHigh = (DWORD)(Offset >> 32);
   DWORD n;
@@ -1262,11 +1272,6 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
 /* 枚举 upper 或 lower 层的目录内容并填充目录缓冲区 (处理 whiteout 过滤) */
 static NTSTATUS OvlEnumLayer(PCWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
                              PVOID *PDirBuf, PNTSTATUS PResult) {
-  /* [FIX] upper 侧目录物理不存在 (lower-only 目录) 时按空目录处理 */
-  DWORD A = GetFileAttributesW(DirPath);
-  if (A == INVALID_FILE_ATTRIBUTES || !(A & FILE_ATTRIBUTE_DIRECTORY))
-    return STATUS_SUCCESS;
-
   PWSTR Pat = StrCat2(DirPath, L"\\*");
   if (!Pat)
     return STATUS_NO_MEMORY;
@@ -1296,13 +1301,18 @@ static NTSTATUS OvlEnumLayer(PCWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
     } else if (ns == 1)
       continue; /* upper 或前一个 lower 优先 */
 
-    FSP_FSCTL_DIR_INFO Di;
-    memset(&Di, 0, sizeof Di);
-    SIZE_T Nb = (wcslen(Fd.cFileName) + 1) * sizeof(WCHAR);
-    Di.Size = (UINT16)(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + Nb);
-    GetFileInfoFromFindData(&Fd, &Di.FileInfo);
-    memcpy(Di.FileNameBuf, Fd.cFileName, Nb);
-    if (!FspFileSystemFillDirectoryBuffer(PDirBuf, &Di, PResult)) {
+    UINT8 DiBuf[FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) +
+                MAX_PATH * sizeof(WCHAR)];
+    FSP_FSCTL_DIR_INFO *Di = (FSP_FSCTL_DIR_INFO *)DiBuf;
+    memset(Di, 0, sizeof DiBuf);
+
+    SIZE_T Len = wcslen(Fd.cFileName);
+    Di->Size = (UINT16)(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) +
+                        Len * sizeof(WCHAR));
+    GetFileInfoFromFindData(&Fd, &Di->FileInfo);
+    memcpy(Di->FileNameBuf, Fd.cFileName, Len * sizeof(WCHAR));
+
+    if (!FspFileSystemFillDirectoryBuffer(PDirBuf, Di, PResult)) {
       R = *PResult;
       break;
     }
@@ -1330,7 +1340,8 @@ static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
       FspFileSystemReleaseDirectoryBuffer(&Desc->DirBuffer);
       return STATUS_NO_MEMORY;
     }
-    R = OvlEnumLayer(Desc->UpperPath, TRUE, &Set, &Desc->DirBuffer, &R);
+    if (Desc->UpperExists)
+      R = OvlEnumLayer(Desc->UpperPath, TRUE, &Set, &Desc->DirBuffer, &R);
     if (NT_SUCCESS(R) && Desc->LowerExists)
       R = OvlEnumLayer(Desc->LowerPath, FALSE, &Set, &Desc->DirBuffer, &R);
     NameSetFree(&Set);
@@ -1386,11 +1397,13 @@ static NTSTATUS OvlGetDirInfoByName(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   }
   free(ChildRel);
 
-  SIZE_T Nb = (wcslen(FileName) + 1) * sizeof(WCHAR);
-  memset(DirInfo, 0, sizeof *DirInfo);
-  DirInfo->Size = (UINT16)(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) + Nb);
+  SIZE_T Len = wcslen(Fd.cFileName);
+  memset(DirInfo, 0, FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf));
+  DirInfo->Size = (UINT16)(FIELD_OFFSET(FSP_FSCTL_DIR_INFO, FileNameBuf) +
+                           Len * sizeof(WCHAR));
   GetFileInfoFromFindData(&Fd, &DirInfo->FileInfo);
-  memcpy(DirInfo->FileNameBuf, FileName, Nb);
+  memcpy(DirInfo->FileNameBuf, Fd.cFileName, Len * sizeof(WCHAR));
+
   FindClose(F);
   return STATUS_SUCCESS;
 }
@@ -1428,7 +1441,8 @@ static VOID Usage(void) {
                    L"  -m <挂载点>   盘符或目录 (默认为自动选择)\n"
                    L"  -i <毫秒>     内核元数据缓存超时 (默认值 1000)\n"
                    L"  -t <线程数>   分发线程数 (默认值 0)\n"
-                   L"  -D <级别>     调试日志级别\n");
+                   L"  -d <级别>     调试日志级别\n"
+                   L"  -D <文件>     调试日志文件 (标准错误用 -)\n");
 }
 
 /* 程序主入口，解析参数、初始化 WinFsp 并启动文件系统 */
@@ -1436,7 +1450,7 @@ int wmain(int argc, wchar_t **argv) {
   _setmode(_fileno(stdout), _O_U16TEXT);
   _setmode(_fileno(stderr), _O_U16TEXT);
 
-  PWSTR UpperArg = 0, LowerArg = 0, MountPoint = 0;
+  PWSTR UpperArg = 0, LowerArg = 0, MountPoint = 0, DebugLogFile = 0;
   ULONG InfoTimeout = 1000, Threads = 0, DebugLog = 0;
 
   for (int i = 1; i < argc; i++) {
@@ -1456,8 +1470,10 @@ int wmain(int argc, wchar_t **argv) {
       InfoTimeout = _wtoi(argv[++i]);
     else if (wcscmp(argv[i], L"-t") == 0)
       Threads = _wtoi(argv[++i]);
-    else if (wcscmp(argv[i], L"-D") == 0)
+    else if (wcscmp(argv[i], L"-d") == 0)
       DebugLog = _wtoi(argv[++i]);
+    else if (wcscmp(argv[i], L"-D") == 0)
+      DebugLogFile = argv[++i];
     else {
       Usage();
       return 2;
@@ -1466,6 +1482,23 @@ int wmain(int argc, wchar_t **argv) {
   if (!UpperArg || !LowerArg) {
     Usage();
     return 2;
+  }
+
+  if (DebugLogFile) {
+    HANDLE LogHandle = INVALID_HANDLE_VALUE;
+    if (wcscmp(DebugLogFile, L"-") == 0)
+      LogHandle = GetStdHandle(STD_ERROR_HANDLE);
+    else
+      LogHandle = CreateFileW(DebugLogFile, GENERIC_WRITE, FILE_SHARE_READ, 0,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+
+    if (LogHandle != INVALID_HANDLE_VALUE && LogHandle != NULL) {
+      FspDebugLogSetHandle(LogHandle);
+    } else {
+      fwprintf(stderr, L"无法打开日志文件: %s (错误码: %lu)\n", DebugLogFile,
+               GetLastError());
+      return 1;
+    }
   }
 
   if (!NormalizeRootDir(UpperArg, g_UpperRoot, MAX_PATH)) {

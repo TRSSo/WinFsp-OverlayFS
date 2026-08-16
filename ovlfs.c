@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define OVL_NAME L"OverlayFS v0.0.1"
 #define OVL_DISK_DEVICE_NAME L"WinFsp.Disk"
 #define OVL_NET_DEVICE_NAME L"WinFsp.Net"
 
@@ -165,11 +166,11 @@ static OVL_DESC *AllocDesc(PCWSTR Rel, PWSTR Upper, PWSTR Lower, HANDLE Handle,
 }
 
 /* 从句柄获取文件信息并填充到 FSP_FSCTL_FILE_INFO 结构 */
-static VOID GetFileInfoFromHandle(HANDLE h, FSP_FSCTL_FILE_INFO *Fi) {
+static NTSTATUS GetFileInfoFromHandle(HANDLE h, FSP_FSCTL_FILE_INFO *Fi) {
   BY_HANDLE_FILE_INFORMATION Bh;
   memset(Fi, 0, sizeof *Fi);
   if (!GetFileInformationByHandle(h, &Bh))
-    return;
+    return W32Err(GetLastError());
   UINT64 Size = ((UINT64)Bh.nFileSizeHigh << 32) | Bh.nFileSizeLow;
   Fi->FileAttributes = Bh.dwFileAttributes;
   Fi->FileSize = Size;
@@ -179,6 +180,7 @@ static VOID GetFileInfoFromHandle(HANDLE h, FSP_FSCTL_FILE_INFO *Fi) {
   Fi->LastWriteTime = *(UINT64 *)&Bh.ftLastWriteTime;
   Fi->ChangeTime = *(UINT64 *)&Bh.ftLastWriteTime;
   Fi->IndexNumber = ((UINT64)Bh.nFileIndexHigh << 32) | Bh.nFileIndexLow;
+  return STATUS_SUCCESS;
 }
 
 /* 从 WIN32_FIND_DATAW 获取文件信息并填充到 FSP_FSCTL_FILE_INFO 结构 */
@@ -209,30 +211,6 @@ static HANDLE OpenUnderlying(PCWSTR Path, BOOLEAN IsDir, BOOLEAN Writable,
   return CreateFileW(Path, Access,
                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0,
                      OPEN_EXISTING, Flags, 0);
-}
-
-/* 获取底层句柄的真实大小写路径，并回报给 FSD 用于文件名规范化 */
-static VOID SetNormalizedName(HANDLE Handle, PCWSTR RootUsed,
-                              FSP_FSCTL_FILE_INFO *FileInfo) {
-  FSP_FSCTL_OPEN_FILE_INFO *Ofi = FspFileSystemGetOpenFileInfo(FileInfo);
-  WCHAR Buf[1024];
-  if (!Ofi->NormalizedName)
-    return;
-  DWORD n = GetFinalPathNameByHandleW(Handle, Buf, 1024, VOLUME_NAME_NONE);
-  if (n == 0 || n >= 1024)
-    return;
-  PCWSTR RootLocal = RootUsed; /* "C:\\xxx" -> "\\xxx" */
-  if (RootLocal[0] && RootLocal[1] == L':')
-    RootLocal += 2;
-  SIZE_T rl = wcslen(RootLocal);
-  if (_wcsnicmp(Buf, RootLocal, rl) != 0)
-    return;
-  PCWSTR Rel = Buf + rl;
-  SIZE_T Bytes = wcslen(Rel) * sizeof(WCHAR);
-  if (Bytes <= Ofi->NormalizedNameSize) {
-    memcpy(Ofi->NormalizedName, Rel, Bytes);
-    Ofi->NormalizedNameSize = (UINT16)Bytes;
-  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -420,6 +398,10 @@ static NTSTATUS CopyFileRaw(PCWSTR Src, PCWSTR Dst) {
       while (Got) {
         if (!WriteFile(Dh, (PUINT8)Buf + Off, Got, &Wr, 0)) {
           R = W32Err(GetLastError());
+          break;
+        }
+        if (Wr == 0) {
+          R = STATUS_UNEXPECTED_IO_ERROR;
           break;
         }
         Got -= Wr;
@@ -733,7 +715,7 @@ static NTSTATUS OvlGetVolumeInfo(FSP_FILE_SYSTEM *Fs,
     return W32Err(GetLastError());
   memset(VolumeInfo, 0, sizeof *VolumeInfo);
   VolumeInfo->TotalSize = Total.QuadPart;
-  VolumeInfo->FreeSize = TotalFree.QuadPart;
+  VolumeInfo->FreeSize = FreeAvail.QuadPart;
   VolumeInfo->VolumeLabelLength = (UINT16)(wcslen(g_Label) * sizeof(WCHAR));
   memcpy(VolumeInfo->VolumeLabel, g_Label, VolumeInfo->VolumeLabelLength);
   return STATUS_SUCCESS;
@@ -824,9 +806,7 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
     return STATUS_NO_MEMORY;
   }
   *PFileContext = d;
-  GetFileInfoFromHandle(h, FileInfo);
-  SetNormalizedName(h, d->UpperPath, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(h, FileInfo);
 }
 
 /* 打开现有文件或目录 (处理只读透传和写时复制) */
@@ -912,9 +892,7 @@ static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
     return STATUS_NO_MEMORY;
   }
   *PFileContext = d;
-  GetFileInfoFromHandle(h, FileInfo);
-  SetNormalizedName(h, d->UpperExists ? d->UpperPath : d->LowerPath, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(h, FileInfo);
 }
 
 /* 覆盖现有文件 (截断并可选设置属性) */
@@ -965,8 +943,7 @@ static NTSTATUS OvlOverwrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                               : (cur | FileAttributes));
   }
 
-  GetFileInfoFromHandle(Desc->Handle, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(Desc->Handle, FileInfo);
 }
 
 /* 清理文件上下文 (处理删除操作、whiteout 创建及底层 NTFS 维护) */
@@ -979,18 +956,13 @@ static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PCWSTR FileName,
     return; /* 时间/归档位等由底层 NTFS 自行维护 */
 
   if (Desc->UpperExists) {
-    if (Desc->LowerExists)
-      MakeWhiteout(Desc->RelName);
-    if (Desc->IsDirectory) {
+    if (Desc->IsDirectory)
       PurgeWhiteoutsRecursive(Desc->UpperPath, TRUE);
-    } else
+    else
       DeleteFileW(Desc->UpperPath);
-    if (!Desc->LowerExists)
-      RemoveWhiteout(Desc->RelName);
-  } else if (Desc->LowerExists) {
-    /* 只删 lower 层条目: 只建 whiteout, 不复制数据 */
-    MakeWhiteout(Desc->RelName);
   }
+  if (Desc->LowerExists)
+    MakeWhiteout(Desc->RelName);
 }
 
 /* 关闭文件并释放描述符资源 */
@@ -1027,10 +999,8 @@ static NTSTATUS OvlWrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
   (void)Fs;
   OVL_DESC *Desc = FileContext;
   *PBytesTransferred = 0;
-  if (Length == 0) {
-    GetFileInfoFromHandle(Desc->Handle, FileInfo);
-    return STATUS_SUCCESS;
-  }
+  if (Length == 0)
+    return GetFileInfoFromHandle(Desc->Handle, FileInfo);
 
   if (WriteToEndOfFile) {
     LARGE_INTEGER fs;
@@ -1041,10 +1011,8 @@ static NTSTATUS OvlWrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
     LARGE_INTEGER fs;
     if (!GetFileSizeEx(Desc->Handle, &fs))
       return W32Err(GetLastError());
-    if (Offset >= (UINT64)fs.QuadPart) {
-      GetFileInfoFromHandle(Desc->Handle, FileInfo);
-      return STATUS_SUCCESS;
-    }
+    if (Offset >= (UINT64)fs.QuadPart)
+      return GetFileInfoFromHandle(Desc->Handle, FileInfo);
     if (Offset + Length > (UINT64)fs.QuadPart)
       Length = (ULONG)((UINT64)fs.QuadPart - Offset);
   }
@@ -1057,8 +1025,7 @@ static NTSTATUS OvlWrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
   if (!WriteFile(Desc->Handle, Buffer, Length, &n, &Ov))
     return W32Err(GetLastError());
   *PBytesTransferred = n;
-  GetFileInfoFromHandle(Desc->Handle, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(Desc->Handle, FileInfo);
 }
 
 /* 刷新文件缓冲区到磁盘 */
@@ -1070,16 +1037,14 @@ static NTSTATUS OvlFlush(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   OVL_DESC *Desc = FileContext;
   if (!FlushFileBuffers(Desc->Handle))
     return W32Err(GetLastError());
-  GetFileInfoFromHandle(Desc->Handle, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(Desc->Handle, FileInfo);
 }
 
 /* 获取文件基本信息 */
 static NTSTATUS OvlGetFileInfo(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                FSP_FSCTL_FILE_INFO *FileInfo) {
   (void)Fs;
-  GetFileInfoFromHandle(((OVL_DESC *)FileContext)->Handle, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(((OVL_DESC *)FileContext)->Handle, FileInfo);
 }
 
 /* 设置文件基本属性 (时间戳、文件属性) */
@@ -1110,8 +1075,7 @@ static NTSTATUS OvlSetBasicInfo(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     SetFileTime(Desc->Handle, CreationTime ? &C : 0, LastAccessTime ? &A : 0,
                 LastWriteTime ? &W : 0);
   }
-  GetFileInfoFromHandle(Desc->Handle, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(Desc->Handle, FileInfo);
 }
 
 /* 设置文件大小或分配大小 */
@@ -1138,8 +1102,7 @@ static NTSTATUS OvlSetFileSize(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
       return W32Err(GetLastError());
   }
 
-  GetFileInfoFromHandle(Desc->Handle, FileInfo);
-  return STATUS_SUCCESS;
+  return GetFileInfoFromHandle(Desc->Handle, FileInfo);
 }
 
 /* 递归将 lower 层的目录树 copy-up 到 upper 层 (用于 Rename 前的准备) */
@@ -1235,11 +1198,10 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
 
   UINT32 TAttr;
   if (MergedLookup(NewFileName, &TAttr)) {
-    if (Desc->IsDirectory || !ReplaceIfExists) {
+    if (Desc->IsDirectory || !ReplaceIfExists)
       return STATUS_OBJECT_NAME_COLLISION;
-    } else if (TAttr & FILE_ATTRIBUTE_DIRECTORY) {
+    else if (TAttr & FILE_ATTRIBUTE_DIRECTORY)
       return STATUS_ACCESS_DENIED;
-    }
   }
 
   NTSTATUS R = EnsureUpperParents(NewFileName);
@@ -1291,12 +1253,9 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     CreateWhiteoutsRecursive(Desc->RelName, Desc->UpperPath, Desc->LowerPath);
 
   CloseHandle(Desc->Handle);
-  HANDLE Nh = OpenUnderlying(NewUpper, Desc->IsDirectory, TRUE, 0);
-  if (Nh == INVALID_HANDLE_VALUE) {
-    R = W32Err(GetLastError());
-    return R;
-  }
-  Desc->Handle = Nh;
+  Desc->Handle = OpenUnderlying(NewUpper, Desc->IsDirectory, TRUE, 0);
+  if (Desc->Handle == INVALID_HANDLE_VALUE)
+    return W32Err(GetLastError());
   return STATUS_SUCCESS;
 }
 
@@ -1372,9 +1331,13 @@ static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
       return STATUS_NO_MEMORY;
     }
     R = OvlEnumLayer(Desc->UpperPath, TRUE, &Set, &Desc->DirBuffer, &R);
-    if (NT_SUCCESS(R) && Desc->LowerPath)
+    if (NT_SUCCESS(R) && Desc->LowerExists)
       R = OvlEnumLayer(Desc->LowerPath, FALSE, &Set, &Desc->DirBuffer, &R);
     NameSetFree(&Set);
+    if (!NT_SUCCESS(R)) {
+      FspFileSystemReleaseDirectoryBuffer(&Desc->DirBuffer);
+      return R;
+    }
   }
 
   FspFileSystemReleaseDirectoryBuffer(&Desc->DirBuffer);
@@ -1459,12 +1422,12 @@ static BOOL WINAPI CtrlHandler(DWORD Type) {
 
 /* 打印程序使用帮助信息 */
 static VOID Usage(void) {
-  fwprintf(stderr, L"WinFsp OverlayFS\n"
+  fwprintf(stderr, L"WinFsp " OVL_NAME L"\n"
                    L"用法: ovlfs -u <顶层目录> -l <底层目录> [选项]\n"
                    L"选项:\n"
-                   L"  -m <挂载点>   盘符(如 O: 或 O:)或目录; 缺省自动选择\n"
-                   L"  -i <毫秒>     内核元数据缓存超时, 0=关闭 (缺省 1000)\n"
-                   L"  -t <线程数>   分发线程数, 0=缺省\n"
+                   L"  -m <挂载点>   盘符或目录 (默认为自动选择)\n"
+                   L"  -i <毫秒>     内核元数据缓存超时 (默认值 1000)\n"
+                   L"  -t <线程数>   分发线程数 (默认值 0)\n"
                    L"  -D <级别>     调试日志级别\n");
 }
 
@@ -1565,8 +1528,7 @@ int wmain(int argc, wchar_t **argv) {
   Vp.AllowOpenInKernelMode = 0;
   Vp.PostDispositionWhenNecessaryOnly = 1;
   wcscpy_s(Vp.FileSystemName,
-           sizeof Vp.FileSystemName / sizeof Vp.FileSystemName[0],
-           L"OverlayFS");
+           sizeof Vp.FileSystemName / sizeof Vp.FileSystemName[0], g_Label);
 
   static FSP_FILE_SYSTEM_INTERFACE Iface;
   memset(&Iface, 0, sizeof Iface);
@@ -1589,17 +1551,19 @@ int wmain(int argc, wchar_t **argv) {
   Iface.GetDirInfoByName = OvlGetDirInfoByName;
   Iface.DispatcherStopped = OvlDispatcherStopped;
 
-  FSP_FILE_SYSTEM *FileSystem;
   NTSTATUS R = FspFileSystemPreflight(OVL_DISK_DEVICE_NAME, MountPoint);
   if (!NT_SUCCESS(R)) {
     fwprintf(stderr, L"Preflight 失败: %08lX\n", R);
     return 1;
   }
+  FSP_FILE_SYSTEM *FileSystem;
   R = FspFileSystemCreate(OVL_DISK_DEVICE_NAME, &Vp, &Iface, &FileSystem);
   if (!NT_SUCCESS(R)) {
     fwprintf(stderr, L"Create 失败: %08lX\n", R);
     return 1;
   }
+  if (DebugLog)
+    FspFileSystemSetDebugLog(FileSystem, DebugLog);
   R = FspFileSystemSetMountPoint(FileSystem, MountPoint);
   if (!NT_SUCCESS(R)) {
     fwprintf(stderr, L"挂载失败: %08lX\n", R);
@@ -1610,11 +1574,9 @@ int wmain(int argc, wchar_t **argv) {
     fwprintf(stderr, L"启动分发器失败: %08lX\n", R);
     return 1;
   }
-  if (DebugLog)
-    FspFileSystemSetDebugLog(FileSystem, DebugLog);
 
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
-  wprintf(L"OverlayFS 已挂载: %s (顶层: %s, 底层: %s)\n",
+  wprintf(OVL_NAME L" 已挂载: %s (顶层: %s, 底层: %s)\n",
           FspFileSystemMountPoint(FileSystem), g_UpperRoot, g_LowerRoot);
   fflush(stdout);
 
@@ -1623,6 +1585,6 @@ int wmain(int argc, wchar_t **argv) {
   FspFileSystemStopDispatcher(FileSystem);
   FspFileSystemRemoveMountPoint(FileSystem);
   FspFileSystemDelete(FileSystem);
-  wprintf(L"OverlayFS 已卸载\n");
+  wprintf(OVL_NAME L" 已卸载\n");
   return 0;
 }

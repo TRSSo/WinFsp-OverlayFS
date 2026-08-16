@@ -75,8 +75,10 @@ typedef struct _OVL_DESC {
 /* 小工具                                                              */
 /* ------------------------------------------------------------------ */
 
+/* 将 Win32 错误代码转换为 NTSTATUS 状态码 */
 static NTSTATUS W32Err(DWORD e) { return FspNtStatusFromWin32(e); }
 
+/* 复制宽字符串 */
 static PWSTR StrDup(PCWSTR s) {
   SIZE_T n = (wcslen(s) + 1) * sizeof(WCHAR);
   PWSTR p = malloc(n);
@@ -85,6 +87,7 @@ static PWSTR StrDup(PCWSTR s) {
   return p;
 }
 
+/* 拼接两个宽字符串 */
 static PWSTR StrCat2(PCWSTR a, PCWSTR b) {
   SIZE_T la = wcslen(a), lb = wcslen(b);
   PWSTR p = malloc((la + lb + 1) * sizeof(WCHAR));
@@ -95,6 +98,7 @@ static PWSTR StrCat2(PCWSTR a, PCWSTR b) {
   return p;
 }
 
+/* 拼接三个宽字符串 */
 static PWSTR StrCat3(PCWSTR a, PCWSTR b, PCWSTR c) {
   SIZE_T la = wcslen(a), lb = wcslen(b), lc = wcslen(c);
   PWSTR p = malloc((la + lb + lc + 1) * sizeof(WCHAR));
@@ -106,7 +110,7 @@ static PWSTR StrCat3(PCWSTR a, PCWSTR b, PCWSTR c) {
   return p;
 }
 
-/* 规范化目录路径: 全路径、大写盘符、去尾部反斜杠 */
+/* 规范化根目录路径 (转为全路径、大写盘符、去除尾部反斜杠) */
 static BOOLEAN NormalizeRootDir(PCWSTR In, PWSTR Out, ULONG OutChars) {
   WCHAR Tmp[MAX_PATH];
   DWORD n = GetFullPathNameW(In, MAX_PATH, Tmp, 0);
@@ -127,6 +131,7 @@ static BOOLEAN NormalizeRootDir(PCWSTR In, PWSTR Out, ULONG OutChars) {
   return TRUE;
 }
 
+/* 释放文件描述符及其关联的资源 */
 static VOID FreeDesc(OVL_DESC *Desc) {
   if (Desc->Handle != INVALID_HANDLE_VALUE)
     CloseHandle(Desc->Handle);
@@ -137,6 +142,7 @@ static VOID FreeDesc(OVL_DESC *Desc) {
   free(Desc);
 }
 
+/* 分配并初始化一个新的文件描述符 */
 static OVL_DESC *AllocDesc(PCWSTR Rel, PWSTR Upper, PWSTR Lower, HANDLE Handle,
                            BOOLEAN IsDir, BOOLEAN UpExists, BOOLEAN LoExists) {
   OVL_DESC *d = calloc(1, sizeof *d);
@@ -158,6 +164,7 @@ static OVL_DESC *AllocDesc(PCWSTR Rel, PWSTR Upper, PWSTR Lower, HANDLE Handle,
   return d;
 }
 
+/* 从句柄获取文件信息并填充到 FSP_FSCTL_FILE_INFO 结构 */
 static VOID GetFileInfoFromHandle(HANDLE h, FSP_FSCTL_FILE_INFO *Fi) {
   BY_HANDLE_FILE_INFORMATION Bh;
   memset(Fi, 0, sizeof *Fi);
@@ -174,6 +181,7 @@ static VOID GetFileInfoFromHandle(HANDLE h, FSP_FSCTL_FILE_INFO *Fi) {
   Fi->IndexNumber = ((UINT64)Bh.nFileIndexHigh << 32) | Bh.nFileIndexLow;
 }
 
+/* 从 WIN32_FIND_DATAW 获取文件信息并填充到 FSP_FSCTL_FILE_INFO 结构 */
 static VOID GetFileInfoFromFindData(const WIN32_FIND_DATAW *Fd,
                                     FSP_FSCTL_FILE_INFO *Fi) {
   UINT64 Size = ((UINT64)Fd->nFileSizeHigh << 32) | Fd->nFileSizeLow;
@@ -187,7 +195,7 @@ static VOID GetFileInfoFromFindData(const WIN32_FIND_DATAW *Fd,
   Fi->ChangeTime = *(UINT64 *)&Fd->ftLastWriteTime;
 }
 
-/* 打开底层 NTFS 文件; 只读打开仅授予 GENERIC_READ */
+/* 打开底层 NTFS 文件或目录句柄 */
 static HANDLE OpenUnderlying(PCWSTR Path, BOOLEAN IsDir, BOOLEAN Writable,
                              UINT32 CreateOptions) {
   DWORD Access = GENERIC_READ | READ_CONTROL | SYNCHRONIZE;
@@ -203,7 +211,7 @@ static HANDLE OpenUnderlying(PCWSTR Path, BOOLEAN IsDir, BOOLEAN Writable,
                      OPEN_EXISTING, Flags, 0);
 }
 
-/* 把打开句柄的真实大小写名字回报给 FSD (文件名规范化) */
+/* 获取底层句柄的真实大小写路径，并回报给 FSD 用于文件名规范化 */
 static VOID SetNormalizedName(HANDLE Handle, PCWSTR RootUsed,
                               FSP_FSCTL_FILE_INFO *FileInfo) {
   FSP_FSCTL_OPEN_FILE_INFO *Ofi = FspFileSystemGetOpenFileInfo(FileInfo);
@@ -231,6 +239,7 @@ static VOID SetNormalizedName(HANDLE Handle, PCWSTR RootUsed,
 /* 合并视图查找 / whiteout                                             */
 /* ------------------------------------------------------------------ */
 
+/* 在 lower 层查找指定相对路径，若存在则返回其全路径 */
 static BOOLEAN FindLowerPath(PCWSTR Rel, PWSTR *Path) {
   PWSTR p = StrCat2(g_LowerRoot, Rel);
   if (p && GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) {
@@ -241,6 +250,7 @@ static BOOLEAN FindLowerPath(PCWSTR Rel, PWSTR *Path) {
   return FALSE;
 }
 
+/* 构造指定相对路径对应的 whiteout 文件全路径 */
 static PWSTR WhiteoutPathOf(PCWSTR Rel) {
   PCWSTR Slash = wcsrchr(Rel, L'\\');
   if (!Slash)
@@ -258,6 +268,7 @@ static PWSTR WhiteoutPathOf(PCWSTR Rel) {
   return p;
 }
 
+/* 检查指定相对路径是否存在 whiteout 标记 */
 static BOOLEAN WhiteoutExistsAt(PCWSTR Rel) {
   PWSTR wp = WhiteoutPathOf(Rel);
   if (!wp) {
@@ -271,6 +282,7 @@ static BOOLEAN WhiteoutExistsAt(PCWSTR Rel) {
 static VOID MakeWhiteout(PCWSTR Rel); /* 前向声明 */
 static NTSTATUS EnsureUpperParents(PCWSTR Rel);
 
+/* 在合并视图 (upper 优先，其次 lower) 中查找文件属性 */
 static BOOLEAN MergedLookup(PCWSTR Rel, PUINT32 PAttr) {
   PWSTR Upper = StrCat2(g_UpperRoot, Rel);
   if (Upper) {
@@ -299,6 +311,7 @@ static BOOLEAN MergedLookup(PCWSTR Rel, PUINT32 PAttr) {
 /* upper 父目录惰性 copy-up                                            */
 /* ------------------------------------------------------------------ */
 
+/* 复制文件的元数据 (如属性、时间戳) 从源路径到目标路径 */
 static VOID CopyFileMeta(PCWSTR Src, PCWSTR Dst) {
   DWORD A = GetFileAttributesW(Src);
   if (A != INVALID_FILE_ATTRIBUTES)
@@ -322,6 +335,7 @@ static VOID CopyFileMeta(PCWSTR Src, PCWSTR Dst) {
     CloseHandle(Dh);
 }
 
+/* 确保 upper 层存在指定的目录，若不存在则从 lower 层 copy-up */
 static NTSTATUS EnsureUpperDir(PCWSTR Rel) {
   PWSTR Upper = StrCat2(g_UpperRoot, Rel);
   if (!Upper)
@@ -347,6 +361,7 @@ static NTSTATUS EnsureUpperDir(PCWSTR Rel) {
   return STATUS_SUCCESS;
 }
 
+/* 确保 upper 层存在指定路径的所有父目录 */
 static NTSTATUS EnsureUpperParents(PCWSTR Rel) {
   PWSTR p = StrDup(Rel);
   if (!p)
@@ -369,6 +384,7 @@ static NTSTATUS EnsureUpperParents(PCWSTR Rel) {
 /* copy-up 引擎 (同路径并发去重)                                       */
 /* ------------------------------------------------------------------ */
 
+/* 底层文件数据流复制 (用于 copy-up) */
 static NTSTATUS CopyFileRaw(PCWSTR Src, PCWSTR Dst) {
   NTSTATUS R = STATUS_SUCCESS;
   HANDLE Sh = CreateFileW(
@@ -428,6 +444,7 @@ static NTSTATUS CopyFileRaw(PCWSTR Src, PCWSTR Dst) {
   return R;
 }
 
+/* 将单个文件或目录从 lower 层 copy-up 到 upper 层 */
 static NTSTATUS CopyUpOne(PCWSTR Lower, PCWSTR Upper) {
   DWORD A = GetFileAttributesW(Lower);
   if (A == INVALID_FILE_ATTRIBUTES)
@@ -441,6 +458,7 @@ static NTSTATUS CopyUpOne(PCWSTR Lower, PCWSTR Upper) {
   return CopyFileRaw(Lower, Upper);
 }
 
+/* 释放 copy-up 引擎的引用计数并清理资源 */
 static VOID CopyUpRelease(OVL_COPYUP *Cu) {
   EnterCriticalSection(&g_CopyUpCs);
   if (--Cu->Refs == 0) {
@@ -453,6 +471,7 @@ static VOID CopyUpRelease(OVL_COPYUP *Cu) {
   LeaveCriticalSection(&g_CopyUpCs);
 }
 
+/* 并发安全的 copy-up 执行函数 (同路径并发去重) */
 static NTSTATUS CopyUpPath(PCWSTR Lower, PCWSTR Upper) {
   OVL_COPYUP *Cu, **Slot;
   BOOLEAN Mine = FALSE;
@@ -498,7 +517,7 @@ static NTSTATUS CopyUpPath(PCWSTR Lower, PCWSTR Upper) {
   return R;
 }
 
-/* 描述符升级到可写: 必要时 copy-up 并替换句柄 */
+/* 确保描述符指向的文件在 upper 层可写 (必要时触发 copy-up 并替换句柄) */
 static NTSTATUS EnsureUpperWritable(OVL_DESC *Desc) {
   if (Desc->UpperExists)
     return STATUS_SUCCESS;
@@ -523,6 +542,7 @@ static NTSTATUS EnsureUpperWritable(OVL_DESC *Desc) {
 /* whiteout / 清理                                                     */
 /* ------------------------------------------------------------------ */
 
+/* 创建 whiteout 文件以在 upper 层隐藏 lower 层的同名条目 */
 static VOID MakeWhiteout(PCWSTR Rel) {
   PWSTR wp = WhiteoutPathOf(Rel);
   if (!wp)
@@ -535,7 +555,7 @@ static VOID MakeWhiteout(PCWSTR Rel) {
   free(wp);
 }
 
-/* 递归删除 upper 目录树中的所有文件或 whiteout */
+/* 递归删除 upper 目录树中的所有 whiteout 文件或所有文件 */
 static VOID PurgeWhiteoutsRecursive(PCWSTR DirPath, BOOLEAN All) {
   PWSTR Pat = StrCat2(DirPath, L"\\*");
   if (!Pat)
@@ -566,6 +586,7 @@ static VOID PurgeWhiteoutsRecursive(PCWSTR DirPath, BOOLEAN All) {
     RemoveDirectoryW(DirPath);
 }
 
+/* 移除指定路径的 whiteout 文件 */
 static VOID RemoveWhiteout(PCWSTR Rel) {
   PWSTR wp = WhiteoutPathOf(Rel);
   if (!wp)
@@ -581,7 +602,7 @@ static VOID RemoveWhiteout(PCWSTR Rel) {
   free(wp);
 }
 
-/* 递归创建目录中的 whiteout */
+/* 递归在 upper 层创建 whiteout 以隐藏 lower 层的目录内容 */
 static NTSTATUS CreateWhiteoutsRecursive(PCWSTR Rel, PCWSTR Upper,
                                          PCWSTR Lower) {
   DWORD LowerAttr = GetFileAttributesW(Lower);
@@ -635,6 +656,7 @@ typedef struct _NAMESET {
   ULONG Count, Capacity;
 } NAMESET;
 
+/* 计算字符串的 FNV-1a 哈希值 (忽略大小写) */
 static ULONG NameHash(PCWSTR s) {
   ULONG h = 2166136261u;
   for (; *s; s++) {
@@ -646,6 +668,7 @@ static ULONG NameHash(PCWSTR s) {
   return h;
 }
 
+/* 初始化名称哈希集合 (用于目录合并去重) */
 static BOOLEAN NameSetInit(NAMESET *Set, ULONG Cap) {
   Set->Count = 0;
   Set->Capacity = Cap;
@@ -653,12 +676,14 @@ static BOOLEAN NameSetInit(NAMESET *Set, ULONG Cap) {
   return Set->Items != 0;
 }
 
+/* 释放名称哈希集合占用的内存 */
 static VOID NameSetFree(NAMESET *Set) {
   for (ULONG i = 0; i < Set->Capacity; i++)
     free(Set->Items[i]);
   free(Set->Items);
 }
 
+/* 向哈希集合中插入名称，返回 0 表示成功，1 表示已存在，-1 表示内存分配失败 */
 static char NameSetInsert(NAMESET *Set, PCWSTR Name) {
   if ((Set->Count + 1) * 10 >= Set->Capacity * 7) {
     ULONG NewCap = Set->Capacity * 2;
@@ -699,6 +724,7 @@ static char NameSetInsert(NAMESET *Set, PCWSTR Name) {
 /* 文件系统操作实现                                                    */
 /* ------------------------------------------------------------------ */
 
+/* 获取卷信息 (总大小、可用空间、卷标等) */
 static NTSTATUS OvlGetVolumeInfo(FSP_FILE_SYSTEM *Fs,
                                  FSP_FSCTL_VOLUME_INFO *VolumeInfo) {
   (void)Fs;
@@ -713,6 +739,7 @@ static NTSTATUS OvlGetVolumeInfo(FSP_FILE_SYSTEM *Fs,
   return STATUS_SUCCESS;
 }
 
+/* 设置卷标 */
 static NTSTATUS OvlSetVolumeLabel(FSP_FILE_SYSTEM *Fs, PWSTR VolumeLabel,
                                   FSP_FSCTL_VOLUME_INFO *VolumeInfo) {
   (void)Fs;
@@ -720,7 +747,7 @@ static NTSTATUS OvlSetVolumeLabel(FSP_FILE_SYSTEM *Fs, PWSTR VolumeLabel,
   return OvlGetVolumeInfo(0, VolumeInfo);
 }
 
-/* 不做安全检查: 只报属性 + NULL DACL */
+/* 获取文件的安全描述符和属性 (本实现不返回安全描述符，仅返回 NULL DACL) */
 static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                                      PUINT32 PFileAttributes,
                                      PSECURITY_DESCRIPTOR SecurityDescriptor,
@@ -737,6 +764,7 @@ static NTSTATUS OvlGetSecurityByName(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
   return STATUS_SUCCESS;
 }
 
+/* 创建新文件或目录 */
 static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                           UINT32 CreateOptions, UINT32 GrantedAccess,
                           UINT32 FileAttributes,
@@ -801,6 +829,7 @@ static NTSTATUS OvlCreate(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
   return STATUS_SUCCESS;
 }
 
+/* 打开现有文件或目录 (处理只读透传和写时复制) */
 static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
                         UINT32 CreateOptions, UINT32 GrantedAccess,
                         PVOID *PFileContext, FSP_FSCTL_FILE_INFO *FileInfo) {
@@ -888,6 +917,7 @@ static NTSTATUS OvlOpen(FSP_FILE_SYSTEM *Fs, PCWSTR FileName,
   return STATUS_SUCCESS;
 }
 
+/* 覆盖现有文件 (截断并可选设置属性) */
 static NTSTATUS OvlOverwrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                              UINT32 FileAttributes,
                              BOOLEAN ReplaceFileAttributes,
@@ -939,6 +969,7 @@ static NTSTATUS OvlOverwrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
+/* 清理文件上下文 (处理删除操作、whiteout 创建及底层 NTFS 维护) */
 static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PCWSTR FileName,
                        ULONG Flags) {
   (void)Fs;
@@ -962,11 +993,13 @@ static VOID OvlCleanup(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PCWSTR FileName,
   }
 }
 
+/* 关闭文件并释放描述符资源 */
 static VOID OvlClose(FSP_FILE_SYSTEM *Fs, PVOID FileContext) {
   (void)Fs;
   FreeDesc(FileContext);
 }
 
+/* 读取文件数据 */
 static NTSTATUS OvlRead(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
                         UINT64 Offset, ULONG Length, PULONG PBytesTransferred) {
   (void)Fs;
@@ -986,6 +1019,7 @@ static NTSTATUS OvlRead(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
   return STATUS_SUCCESS;
 }
 
+/* 写入文件数据 */
 static NTSTATUS OvlWrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
                          UINT64 Offset, ULONG Length, BOOLEAN WriteToEndOfFile,
                          BOOLEAN ConstrainedIo, PULONG PBytesTransferred,
@@ -1027,6 +1061,7 @@ static NTSTATUS OvlWrite(FSP_FILE_SYSTEM *Fs, PVOID FileContext, PVOID Buffer,
   return STATUS_SUCCESS;
 }
 
+/* 刷新文件缓冲区到磁盘 */
 static NTSTATUS OvlFlush(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                          FSP_FSCTL_FILE_INFO *FileInfo) {
   (void)Fs;
@@ -1039,6 +1074,7 @@ static NTSTATUS OvlFlush(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
+/* 获取文件基本信息 */
 static NTSTATUS OvlGetFileInfo(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                FSP_FSCTL_FILE_INFO *FileInfo) {
   (void)Fs;
@@ -1046,6 +1082,7 @@ static NTSTATUS OvlGetFileInfo(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
+/* 设置文件基本属性 (时间戳、文件属性) */
 static NTSTATUS OvlSetBasicInfo(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                 UINT32 FileAttributes, UINT64 CreationTime,
                                 UINT64 LastAccessTime, UINT64 LastWriteTime,
@@ -1077,6 +1114,7 @@ static NTSTATUS OvlSetBasicInfo(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
+/* 设置文件大小或分配大小 */
 static NTSTATUS OvlSetFileSize(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                UINT64 NewSize, BOOLEAN SetAllocationSize,
                                FSP_FSCTL_FILE_INFO *FileInfo) {
@@ -1104,7 +1142,7 @@ static NTSTATUS OvlSetFileSize(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
-/* 递归把 lower 目录树 copy-up 到 upper */
+/* 递归将 lower 层的目录树 copy-up 到 upper 层 (用于 Rename 前的准备) */
 static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
   PWSTR Lower = 0;
   if (!FindLowerPath(Rel, &Lower))
@@ -1130,7 +1168,7 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
   }
   if (UpperAttr == INVALID_FILE_ATTRIBUTES) {
     if (!(LowerAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-      NTSTATUS R = CopyFileRaw(Lower, Upper);
+      NTSTATUS R = CopyUpPath(Lower, Upper);
       free(Upper);
       free(Lower);
       return R;
@@ -1144,12 +1182,13 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
     }
   }
 
-  if (!CreateDirectoryW(Upper, 0) && GetLastError() != ERROR_ALREADY_EXISTS) {
+  NTSTATUS R = CopyUpPath(Lower, Upper);
+  if (!NT_SUCCESS(R)) {
     free(Upper);
     free(Lower);
-    return W32Err(GetLastError());
+    return R;
   }
-  CopyFileMeta(Lower, Upper);
+
   PWSTR Pat = StrCat2(Lower, L"\\*");
   if (!Pat) {
     free(Upper);
@@ -1166,7 +1205,6 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
     return W32Err(GetLastError());
   }
 
-  NTSTATUS R = STATUS_SUCCESS;
   do {
     if (wcscmp(Fd.cFileName, L".") == 0 || wcscmp(Fd.cFileName, L"..") == 0)
       continue;
@@ -1187,6 +1225,7 @@ static NTSTATUS EnsureUpperRecursive(PCWSTR Rel) {
   return R;
 }
 
+/* 重命名文件或目录 (处理跨层移动及 whiteout 更新) */
 static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                           PCWSTR FileName, PCWSTR NewFileName,
                           BOOLEAN ReplaceIfExists) {
@@ -1258,10 +1297,10 @@ static NTSTATUS OvlRename(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
     return R;
   }
   Desc->Handle = Nh;
-
   return STATUS_SUCCESS;
 }
 
+/* 枚举 upper 或 lower 层的目录内容并填充目录缓冲区 (处理 whiteout 过滤) */
 static NTSTATUS OvlEnumLayer(PCWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
                              PVOID *PDirBuf, PNTSTATUS PResult) {
   /* [FIX] upper 侧目录物理不存在 (lower-only 目录) 时按空目录处理 */
@@ -1313,6 +1352,7 @@ static NTSTATUS OvlEnumLayer(PCWSTR DirPath, BOOLEAN IsUpper, NAMESET *Set,
   return R;
 }
 
+/* 读取目录内容 (合并 upper 和 lower 层并去重) */
 static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                  PWSTR Pattern, PWSTR Marker, PVOID Buffer,
                                  ULONG Length, PULONG PBytesTransferred) {
@@ -1343,6 +1383,7 @@ static NTSTATUS OvlReadDirectory(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
+/* 通过文件名获取目录项信息 (快速路径) */
 static NTSTATUS OvlGetDirInfoByName(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
                                     PCWSTR FileName,
                                     FSP_FSCTL_DIR_INFO *DirInfo) {
@@ -1391,6 +1432,7 @@ static NTSTATUS OvlGetDirInfoByName(FSP_FILE_SYSTEM *Fs, PVOID FileContext,
   return STATUS_SUCCESS;
 }
 
+/* 分发器停止时的回调函数 (触发主线程退出) */
 static VOID OvlDispatcherStopped(FSP_FILE_SYSTEM *Fs, BOOLEAN Normally) {
   (void)Fs;
   (void)Normally;
@@ -1401,6 +1443,7 @@ static VOID OvlDispatcherStopped(FSP_FILE_SYSTEM *Fs, BOOLEAN Normally) {
 /* 主程序                                                              */
 /* ------------------------------------------------------------------ */
 
+/* 控制台控制事件处理函数 (处理 Ctrl+C、关闭控制台等事件) */
 static BOOL WINAPI CtrlHandler(DWORD Type) {
   switch (Type) {
   case CTRL_C_EVENT:
@@ -1414,6 +1457,7 @@ static BOOL WINAPI CtrlHandler(DWORD Type) {
   return FALSE;
 }
 
+/* 打印程序使用帮助信息 */
 static VOID Usage(void) {
   fwprintf(stderr, L"WinFsp OverlayFS\n"
                    L"用法: ovlfs -u <顶层目录> -l <底层目录> [选项]\n"
@@ -1424,6 +1468,7 @@ static VOID Usage(void) {
                    L"  -D <级别>     调试日志级别\n");
 }
 
+/* 程序主入口，解析参数、初始化 WinFsp 并启动文件系统 */
 int wmain(int argc, wchar_t **argv) {
   _setmode(_fileno(stdout), _O_U16TEXT);
   _setmode(_fileno(stderr), _O_U16TEXT);
@@ -1520,7 +1565,8 @@ int wmain(int argc, wchar_t **argv) {
   Vp.AllowOpenInKernelMode = 0;
   Vp.PostDispositionWhenNecessaryOnly = 1;
   wcscpy_s(Vp.FileSystemName,
-           sizeof Vp.FileSystemName / sizeof Vp.FileSystemName[0], L"OverlayFS");
+           sizeof Vp.FileSystemName / sizeof Vp.FileSystemName[0],
+           L"OverlayFS");
 
   static FSP_FILE_SYSTEM_INTERFACE Iface;
   memset(&Iface, 0, sizeof Iface);

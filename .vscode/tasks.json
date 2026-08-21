@@ -6,10 +6,11 @@
 			"label": "MSVC: build active file",
 			"command": "cl.exe",
 			"args": [
+				"/utf-8",
 				"/O2",
 				"/W3",
 				"/I${env:ProgramFiles(x86)}\\WinFsp\\inc",
-				"${workspaceFolder}\\ovlfs.c",
+				"${fileBasename}",
 				"/link",
 				"/LIBPATH:${env:ProgramFiles(x86)}\\WinFsp\\lib",
 				"winfsp-x64.lib"

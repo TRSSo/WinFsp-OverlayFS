@@ -29,7 +29,7 @@ jobs:
         Get-ChildItem -Filter *.c | ForEach-Object {
           $content = Get-Content $_.FullName -Raw
           $replaced = $content -replace 'v0\.0\.0', $VERSION
-          Set-Content -Path "$($_.Name)" -Value $replaced -NoNewline -Encoding utf8BOM
+          Set-Content -Path "$($_.Name)" -Value $replaced -NoNewline -Encoding utf8
         }
 
     - name: Download and Verify WinFsp MSI
@@ -62,7 +62,7 @@ jobs:
     - name: Build OverlayFS
       run: |
         $OUTPUT_NAME = "ovlfs-$($env:GITHUB_REF_NAME.Replace('/', '-')).exe"
-        cl /O2 /W3 /I "${env:ProgramFiles(x86)}\WinFsp\inc" ovlfs.c /link /LIBPATH:"${env:ProgramFiles(x86)}\WinFsp\lib" winfsp-x64.lib "/OUT:$OUTPUT_NAME"
+        cl /utf-8 /O2 /W3 /I "${env:ProgramFiles(x86)}\WinFsp\inc" ovlfs.c /link /LIBPATH:"${env:ProgramFiles(x86)}\WinFsp\lib" winfsp-x64.lib "/OUT:$OUTPUT_NAME"
         if (($LASTEXITCODE -ne 0) -or (-not (Test-Path $OUTPUT_NAME))) {
           throw "Build failed with exit code $LASTEXITCODE"
         }

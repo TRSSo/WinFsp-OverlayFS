@@ -23,7 +23,7 @@
 请在 **Developer Command Prompt for VS** (VS 开发者命令行) 中执行以下命令：
 
 ```cmd
-cl /O2 /W3 /I "%ProgramFiles(x86)%\WinFsp\inc" ovlfs.c /link /LIBPATH:"%ProgramFiles(x86)%\WinFsp\lib" winfsp-x64.lib
+cl /utf-8 /O2 /W3 /I "%ProgramFiles(x86)%\WinFsp\inc" ovlfs.c /link /LIBPATH:"%ProgramFiles(x86)%\WinFsp\lib" winfsp-x64.lib
 ```
 
 ## 运行与使用

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ovlfs.c - WinFsp OverlayFS（upper 可写层 + lower 只读层）
  *
  * 语义:
@@ -8,30 +8,19 @@
  *   - 不实现: ACL/安全描述符(NULL DACL)、EA、命名流、重解析点、硬链接
  *
  * 编译 (VS 开发者命令行):
- *   cl /O2 /W3 /I "%ProgramFiles(x86)%\WinFsp\inc" ovlfs.c /link
- * /LIBPATH:"%ProgramFiles(x86)%\WinFsp\lib" winfsp-x64.lib
+ *   cl /utf-8 /O2 /W3 /I "%ProgramFiles(x86)%\WinFsp\inc" ovlfs.c /link
+ * LIBPATH:"%ProgramFiles(x86)%\WinFsp\lib" winfsp-x64.lib
  *
  * 运行:
  *   ovlfs -u C:\upper -l C:\lower -m O: [-i 1000] [-t 0] [-D 1]
  */
 
-#define WIN32_NO_STATUS
+#include <locale.h>
+#include <stdio.h>
 #include <windows.h>
-#undef WIN32_NO_STATUS
-#include <winternl.h>
-#pragma warning(push)
-#pragma warning(disable : 4005)
-#include <ntstatus.h>
-#pragma warning(pop)
 #include <winfsp/winfsp.h>
 
-#include <fcntl.h>
-#include <io.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#define OVL_NAME L"OverlayFS v0.0.0"
+#define OVL_NAME "OverlayFS v0.0.0"
 #define OVL_DISK_DEVICE_NAME L"WinFsp.Disk"
 
 #define WHITEOUT_PREFIX L"\uF03A\uF02E"
@@ -1494,20 +1483,21 @@ static BOOL WINAPI CtrlHandler(DWORD Type) {
 
 /* 打印程序使用帮助信息 */
 static VOID Usage(void) {
-  fwprintf(stderr, L"WinFsp " OVL_NAME L"\n"
-                   L"用法: ovlfs -u <顶层目录> -l <底层目录> [选项]\n"
-                   L"选项:\n"
-                   L"  -m <挂载点>   盘符或目录 (默认为自动选择)\n"
-                   L"  -i <毫秒>     内核元数据缓存超时 (默认值 1000)\n"
-                   L"  -t <线程数>   分发线程数 (默认值 0)\n"
-                   L"  -d <级别>     调试日志级别\n"
-                   L"  -D <文件>     调试日志文件 (标准错误用 -)\n");
+  fprintf(stderr, "WinFsp " OVL_NAME "\n"
+                  "用法: ovlfs -u <顶层目录> -l <底层目录> [选项]\n"
+                  "选项:\n"
+                  "  -m <挂载点>   盘符或目录 (默认为自动选择)\n"
+                  "  -i <毫秒>     内核元数据缓存超时 (默认值 1000)\n"
+                  "  -t <线程数>   分发线程数 (默认值 0)\n"
+                  "  -d <级别>     调试日志级别\n"
+                  "  -D <文件>     调试日志文件 (标准错误用 -)\n");
 }
 
 /* 程序主入口，解析参数、初始化 WinFsp 并启动文件系统 */
 int wmain(int argc, wchar_t **argv) {
-  _setmode(_fileno(stdout), _O_U16TEXT);
-  _setmode(_fileno(stderr), _O_U16TEXT);
+  setlocale(LC_ALL, ".UTF-8");
+  SetConsoleCP(CP_UTF8);
+  SetConsoleOutputCP(CP_UTF8);
 
   PWSTR UpperArg = 0, LowerArg = 0, MountPoint = 0, DebugLogFile = 0;
   ULONG InfoTimeout = 1000, Threads = 0, DebugLog = 0;
@@ -1554,14 +1544,14 @@ int wmain(int argc, wchar_t **argv) {
     if (LogHandle != INVALID_HANDLE_VALUE && LogHandle != NULL) {
       FspDebugLogSetHandle(LogHandle);
     } else {
-      fwprintf(stderr, L"无法打开日志文件: %s (错误码: %lu)\n", DebugLogFile,
-               GetLastError());
+      fprintf(stderr, "无法打开日志文件: %ls (错误码: %lu)\n", DebugLogFile,
+              GetLastError());
       return 1;
     }
   }
 
   if (!NormalizeRootDir(UpperArg, g_UpperRoot, MAX_PATH)) {
-    fwprintf(stderr, L"无效的顶层目录\n");
+    fprintf(stderr, "无效的顶层目录\n");
     return 1;
   }
   {
@@ -1571,7 +1561,7 @@ int wmain(int argc, wchar_t **argv) {
     HANDLE h = CreateFileW(Probe, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_TEMPORARY, 0);
     if (h == INVALID_HANDLE_VALUE) {
-      fwprintf(stderr, L"顶层目录不存在或不可写: %s\n", g_UpperRoot);
+      fprintf(stderr, "顶层目录不存在或不可写: %ls\n", g_UpperRoot);
       return 1;
     }
     CloseHandle(h);
@@ -1579,11 +1569,11 @@ int wmain(int argc, wchar_t **argv) {
   }
 
   if (!NormalizeRootDir(LowerArg, g_LowerRoot, MAX_PATH)) {
-    fwprintf(stderr, L"无效的底层目录: %s\n", LowerArg);
+    fprintf(stderr, "无效的底层目录: %ls\n", LowerArg);
     return 1;
   }
   if (GetFileAttributesW(g_LowerRoot) == INVALID_FILE_ATTRIBUTES) {
-    fwprintf(stderr, L"底层目录不存在: %s\n", g_LowerRoot);
+    fprintf(stderr, "底层目录不存在: %ls\n", g_LowerRoot);
     return 1;
   }
 
@@ -1646,31 +1636,31 @@ int wmain(int argc, wchar_t **argv) {
 
   NTSTATUS R = FspFileSystemPreflight(OVL_DISK_DEVICE_NAME, MountPoint);
   if (!NT_SUCCESS(R)) {
-    fwprintf(stderr, L"Preflight 失败: %08lX\n", R);
+    fprintf(stderr, "Preflight 失败: %08lX\n", R);
     return 1;
   }
   FSP_FILE_SYSTEM *FileSystem;
   R = FspFileSystemCreate(OVL_DISK_DEVICE_NAME, &Vp, &Iface, &FileSystem);
   if (!NT_SUCCESS(R)) {
-    fwprintf(stderr, L"Create 失败: %08lX\n", R);
+    fprintf(stderr, "Create 失败: %08lX\n", R);
     return 1;
   }
   if (DebugLog)
     FspFileSystemSetDebugLog(FileSystem, DebugLog);
   R = FspFileSystemSetMountPoint(FileSystem, MountPoint);
   if (!NT_SUCCESS(R)) {
-    fwprintf(stderr, L"挂载失败: %08lX\n", R);
+    fprintf(stderr, "挂载失败: %08lX\n", R);
     return 1;
   }
   R = FspFileSystemStartDispatcher(FileSystem, Threads);
   if (!NT_SUCCESS(R)) {
-    fwprintf(stderr, L"启动分发器失败: %08lX\n", R);
+    fprintf(stderr, "启动分发器失败: %08lX\n", R);
     return 1;
   }
 
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
-  wprintf(OVL_NAME L" 已挂载: %s (顶层: %s, 底层: %s)\n",
-          FspFileSystemMountPoint(FileSystem), g_UpperRoot, g_LowerRoot);
+  printf(OVL_NAME " 已挂载: %ls (顶层: %ls, 底层: %ls)\n",
+         FspFileSystemMountPoint(FileSystem), g_UpperRoot, g_LowerRoot);
   fflush(stdout);
 
   WaitForSingleObject(g_StopEvent, INFINITE);
@@ -1678,6 +1668,6 @@ int wmain(int argc, wchar_t **argv) {
   FspFileSystemStopDispatcher(FileSystem);
   FspFileSystemRemoveMountPoint(FileSystem);
   FspFileSystemDelete(FileSystem);
-  wprintf(OVL_NAME L" 已卸载\n");
+  printf(OVL_NAME " 已卸载\n");
   return 0;
 }
